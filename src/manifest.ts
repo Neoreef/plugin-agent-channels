@@ -20,6 +20,7 @@ const manifest: PaperclipPluginManifestV1 = {
   capabilities: [
     "companies.read",
     "agents.read",
+    "access.members.read",
     "agent.sessions.create",
     "agent.sessions.send",
     "activity.log.write",

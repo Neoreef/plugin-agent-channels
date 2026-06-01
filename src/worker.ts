@@ -21,6 +21,12 @@ import type { ZohoAuthState, BotAgentMapping } from "./lib/types.js";
 import { proactiveServiceTokenRefresh } from "./lib/cliq-client.js";
 import { handleCliqWebhook } from "./modules/cliq/webhook-handler.js";
 import { getBotMappings, saveBotMappings } from "./modules/cliq/bot-mapping.js";
+import {
+  getUserMappings,
+  saveUserMappings,
+  listPaperclipUsers,
+} from "./modules/identity/user-mapping.js";
+import type { UserIdentityMapping } from "./lib/types.js";
 
 let currentContext: PluginContext | null = null;
 
@@ -243,11 +249,32 @@ const plugin: PaperclipPlugin = definePlugin({
       return services ?? [];
     });
 
+    // ─── User identity mapping (Zoho ↔ Paperclip) ─────────────
+    ctx.data.register("user-mappings", async () => {
+      return { mappings: await getUserMappings(ctx) };
+    });
+
+    ctx.data.register("paperclip-users", async (params) => {
+      try {
+        const companyId = params.companyId as string;
+        if (!companyId) return { users: [] };
+        return { users: await listPaperclipUsers(ctx, companyId) };
+      } catch (e) {
+        return { users: [], error: String(e) };
+      }
+    });
+
     // ─── Action Handlers ─────────────────────────────────────
 
     ctx.actions.register("save-bot-mappings", async (params) => {
       const mappings = params.mappings as BotAgentMapping[];
       await saveBotMappings(ctx, mappings);
+      return { ok: true };
+    });
+
+    ctx.actions.register("save-user-mappings", async (params) => {
+      const mappings = params.mappings as UserIdentityMapping[];
+      await saveUserMappings(ctx, mappings);
       return { ok: true };
     });
 
