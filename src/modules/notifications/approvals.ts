@@ -3,8 +3,8 @@
  *
  * Outbound: on `approval.created`, DM the company's board/owner users (those
  * with a Zoho identity mapping) a card with action buttons.
- * Inbound: the Deluge `agentChannelsButtonCallback` posts the button key back to
- * the cliq webhook; we resolve the clicker, then approve/reject via the
+ * Inbound: the Deluge `agentChannelsCallback` button function posts the button
+ * key back to the cliq webhook; we resolve the clicker, then approve/reject via the
  * Paperclip API.
  *
  * Acting on an approval requires board auth (POST /approvals/:id/approve is
@@ -21,7 +21,8 @@ import { sendCliqMessage, type CliqButton } from "../../lib/cliq-client.js";
 import { getBotMappings } from "../cliq/bot-mapping.js";
 import { resolveZohoUser, resolvePaperclipUser, listPaperclipUsers } from "../identity/user-mapping.js";
 
-const BTN_ACTION = { type: "invoke.function" as const, data: { name: "agentChannelsButtonCallback" } };
+// Must match the Deluge button function name shown in the settings UI guide.
+const BTN_ACTION = { type: "invoke.function" as const, data: { name: "agentChannelsCallback" } };
 
 function asString(v: unknown): string | undefined {
   return typeof v === "string" && v.trim().length > 0 ? v.trim() : undefined;
