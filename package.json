@@ -1,0 +1,42 @@
+{
+  "name": "@paperclipai/plugin-agent-channels",
+  "version": "0.1.0",
+  "description": "Routes Paperclip agent conversations through messaging channels — Zoho Cliq, Teams, Discord, Slack",
+  "type": "module",
+  "private": false,
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "paperclipPlugin": {
+    "manifest": "./dist/manifest.js",
+    "worker": "./dist/worker.js",
+    "ui": "./dist/ui/"
+  },
+  "scripts": {
+    "build": "tsc -p ./tsconfig.json && node ./scripts/build-ui.mjs",
+    "clean": "rm -rf dist",
+    "typecheck": "tsc --noEmit -p ./tsconfig.json"
+  },
+  "dependencies": {
+    "@paperclipai/plugin-sdk": "*",
+    "@paperclipai/shared": "*"
+  },
+  "devDependencies": {
+    "esbuild": "^0.27.3",
+    "@types/node": "^24.6.0",
+    "@types/react": "^19.0.8",
+    "@types/react-dom": "^19.0.3",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "typescript": "^5.7.3"
+  },
+  "peerDependencies": {
+    "react": ">=18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/bernesto/plugin-agent-channels.git"
+  },
+  "author": "Brian Ernesto <bernesto@neoreef.com>",
+  "license": "MIT"
+}
