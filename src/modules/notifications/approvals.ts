@@ -18,8 +18,8 @@
 
 import type { PluginContext, PluginEvent } from "@paperclipai/plugin-sdk";
 import { sendCliqMessage, type CliqButton } from "../../lib/cliq-client.js";
-import { resolvePaperclipUser } from "../identity/user-mapping.js";
-import { botForCompany, dmMappedUsers, getNotifyConfig, ownerPrincipalIds } from "./common.js";
+import { dispatchNotification, getNotifyConfig, ownerPrincipalIds } from "./common.js";
+import { resolvePaperclipUserFromCliq } from "./service-notify.js";
 
 // Must match the Deluge button function name shown in the settings UI guide.
 const BTN_ACTION = { type: "invoke.function" as const, data: { name: "agentChannelsCallback" } };
@@ -32,12 +32,6 @@ export async function notifyApprovalCreated(
   const approvalId = event.entityId;
   const companyId = event.companyId;
   if (!approvalId || !companyId) return;
-
-  const bot = await botForCompany(ctx, companyId);
-  if (!bot) {
-    ctx.logger.info(`approval.created ${approvalId}: no enabled bot for company ${companyId}, skipping`);
-    return;
-  }
 
   const { apiToken } = await getNotifyConfig(ctx);
   const detail = (event.payload ?? {}) as { type?: string; issueIds?: string[] };
@@ -59,8 +53,8 @@ export async function notifyApprovalCreated(
     `Approval: \`${approvalId}\`${footer}`;
 
   const owners = await ownerPrincipalIds(ctx, companyId);
-  const delivered = await dmMappedUsers(ctx, bot, owners, text, buttons);
-  ctx.logger.info(`approval.created ${approvalId}: notified ${delivered} owner(s) via bot ${bot}`);
+  const delivered = await dispatchNotification(ctx, companyId, owners, text, buttons);
+  ctx.logger.info(`approval.created ${approvalId}: notified ${delivered} recipient(s)`);
 }
 
 /**
@@ -86,7 +80,7 @@ export async function handleApprovalButton(
   }
 
   // Resolve and authorize the clicker. Only mapped users may act.
-  const pcUser = await resolvePaperclipUser(ctx, senderZohoId);
+  const pcUser = await resolvePaperclipUserFromCliq(ctx, senderZohoId);
   if (!pcUser) {
     await sendCliqMessage(ctx, botName, senderZohoId, "Your Cliq account isn't mapped to a Paperclip user — cannot record a decision.");
     return true;

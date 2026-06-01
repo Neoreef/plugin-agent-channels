@@ -22,13 +22,14 @@ import { proactiveServiceTokenRefresh } from "./lib/cliq-client.js";
 import { handleCliqWebhook } from "./modules/cliq/webhook-handler.js";
 import { getBotMappings, saveBotMappings } from "./modules/cliq/bot-mapping.js";
 import {
-  getUserMappings,
-  saveUserMappings,
+  getServiceNotify,
+  saveServiceNotify,
   listPaperclipUsers,
-} from "./modules/identity/user-mapping.js";
+  type ServiceNotifyConfig,
+} from "./modules/notifications/service-notify.js";
+import { listCliqUsers } from "./lib/cliq-client.js";
 import { notifyApprovalCreated } from "./modules/notifications/approvals.js";
 import { notifyIssueBlocked } from "./modules/notifications/blocked.js";
-import type { UserIdentityMapping } from "./lib/types.js";
 
 let currentContext: PluginContext | null = null;
 
@@ -268,9 +269,11 @@ const plugin: PaperclipPlugin = definePlugin({
       return services ?? [];
     });
 
-    // ─── User identity mapping (Zoho ↔ Paperclip) ─────────────
-    ctx.data.register("user-mappings", async () => {
-      return { mappings: await getUserMappings(ctx) };
+    // ─── Per-service user notifications (Paperclip → channel) ──
+    ctx.data.register("service-notify", async (params) => {
+      const serviceId = params.serviceId as string;
+      if (!serviceId) return { enabled: false, mappings: [] };
+      return await getServiceNotify(ctx, serviceId);
     });
 
     ctx.data.register("paperclip-users", async (params) => {
@@ -278,6 +281,14 @@ const plugin: PaperclipPlugin = definePlugin({
         const companyId = params.companyId as string;
         if (!companyId) return { users: [] };
         return { users: await listPaperclipUsers(ctx, companyId) };
+      } catch (e) {
+        return { users: [], error: String(e) };
+      }
+    });
+
+    ctx.data.register("cliq-users", async () => {
+      try {
+        return { users: await listCliqUsers(ctx) };
       } catch (e) {
         return { users: [], error: String(e) };
       }
@@ -291,9 +302,11 @@ const plugin: PaperclipPlugin = definePlugin({
       return { ok: true };
     });
 
-    ctx.actions.register("save-user-mappings", async (params) => {
-      const mappings = params.mappings as UserIdentityMapping[];
-      await saveUserMappings(ctx, mappings);
+    ctx.actions.register("save-service-notify", async (params) => {
+      const serviceId = params.serviceId as string;
+      const config = params.config as ServiceNotifyConfig;
+      if (!serviceId || !config) return { ok: false, error: "serviceId and config required" };
+      await saveServiceNotify(ctx, serviceId, config);
       return { ok: true };
     });
 

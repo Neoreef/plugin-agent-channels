@@ -8,7 +8,7 @@
  */
 
 import type { PluginContext, PluginEvent } from "@paperclipai/plugin-sdk";
-import { botForCompany, dmMappedUsers, ownerPrincipalIds } from "./common.js";
+import { dispatchNotification, ownerPrincipalIds } from "./common.js";
 
 export async function notifyIssueBlocked(ctx: PluginContext, event: PluginEvent): Promise<void> {
   const issueId = event.entityId;
@@ -21,12 +21,6 @@ export async function notifyIssueBlocked(ctx: PluginContext, event: PluginEvent)
   };
   const added = detail.addedBlockedByIssueIds ?? [];
   if (added.length === 0) return; // only when newly (more) blocked — ignore unblocks
-
-  const bot = await botForCompany(ctx, companyId);
-  if (!bot) {
-    ctx.logger.info(`issue blocked ${issueId}: no enabled bot for company ${companyId}, skipping`);
-    return;
-  }
 
   const issue = await ctx.issues.get(issueId, companyId);
   const ident = issue?.identifier ?? issueId;
@@ -45,8 +39,8 @@ export async function notifyIssueBlocked(ctx: PluginContext, event: PluginEvent)
     `\`${ident}\` ${title}\n` +
     `Now blocked by ${added.length} new issue(s)${totalBlockers ? ` (${totalBlockers} total)` : ""}.`;
 
-  const delivered = await dmMappedUsers(ctx, bot, targets, text);
+  const delivered = await dispatchNotification(ctx, companyId, targets, text);
   ctx.logger.info(
-    `issue blocked ${issueId}: notified ${delivered} ${usedOwners ? "owner(s)" : "assignee/creator"} via bot ${bot}`,
+    `issue blocked ${issueId}: notified ${delivered} recipient(s) (${usedOwners ? "owners" : "assignee/creator"})`,
   );
 }

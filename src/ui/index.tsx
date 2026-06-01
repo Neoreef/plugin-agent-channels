@@ -688,6 +688,8 @@ function CliqConfig({ serviceId }: { serviceId: string }) {
           )}
         </div>
       )}
+
+      {status?.connected && <ServiceNotifySection serviceId={serviceId} companies={companies} />}
     </div>
   );
 }
@@ -702,102 +704,111 @@ function ComingSoonConfig({ serviceDef }: { serviceDef: ServiceDef }) {
   );
 }
 
-// ─── User Identity Mapping (Zoho ↔ Paperclip) ───────────────────────────────
+// ─── Per-service user notifications (Paperclip → channel user) ──────────────
 
 type PaperclipUser = { principalId: string; membershipRole: string | null; status: string };
-type UserMapping = { paperclipUserId: string; zohoUserId: string; displayName?: string; enabled: boolean };
-type UserDraft = { zohoUserId: string; displayName: string; enabled: boolean };
+type CliqUser = { id: string; name: string; email?: string };
+type ChannelUserMapping = { paperclipUserId: string; channelUserId: string; label?: string; enabled: boolean };
+type ServiceNotify = { enabled: boolean; mappings: ChannelUserMapping[] };
 
-function UserMappingPanel() {
-  const { data: companiesData } = usePluginData<{ companies: IdName[] }>("paperclip-companies");
+/**
+ * "Paperclip → User Notifications" for one channel service. Opt-in toggle plus a
+ * table mapping a Paperclip user to this channel's user. Lives inside the
+ * service config so each platform owns its own identity mapping (AC-6).
+ */
+function ServiceNotifySection({ serviceId, companies }: { serviceId: string; companies: IdName[] }) {
+  const { data: notify, refresh } = usePluginData<ServiceNotify>("service-notify", { serviceId });
+  const { data: cliqUsersData } = usePluginData<{ users: CliqUser[] }>("cliq-users");
+  const save = usePluginAction("save-service-notify");
+
   const [companyId, setCompanyId] = useState("");
-  const { data: usersData } = usePluginData<{ users: PaperclipUser[] }>(
+  const { data: pcUsersData } = usePluginData<{ users: PaperclipUser[] }>(
     "paperclip-users",
     companyId ? { companyId } : undefined,
   );
-  const { data: mapData, refresh } = usePluginData<{ mappings: UserMapping[] }>("user-mappings");
-  const saveAction = usePluginAction("save-user-mappings");
 
-  const companies = companiesData?.companies ?? [];
-  const users = usersData?.users ?? [];
-
-  // Editable draft keyed by paperclipUserId, seeded from saved mappings.
-  const [draft, setDraft] = useState<Record<string, UserDraft>>({});
+  const [enabled, setEnabled] = useState(false);
+  const [mappings, setMappings] = useState<ChannelUserMapping[]>([]);
   useEffect(() => {
-    const d: Record<string, UserDraft> = {};
-    for (const m of mapData?.mappings ?? []) {
-      d[m.paperclipUserId] = { zohoUserId: m.zohoUserId, displayName: m.displayName ?? "", enabled: m.enabled };
-    }
-    setDraft(d);
-  }, [mapData]);
+    if (notify) { setEnabled(!!notify.enabled); setMappings(notify.mappings ?? []); }
+  }, [notify]);
 
-  const set = (pid: string, patch: Partial<UserDraft>) =>
-    setDraft((prev) => {
-      const base: UserDraft = prev[pid] ?? { zohoUserId: "", displayName: "", enabled: true };
-      return { ...prev, [pid]: { ...base, ...patch } };
-    });
+  const [newPc, setNewPc] = useState("");
+  const [newCliq, setNewCliq] = useState("");
 
-  async function save() {
-    const merged: UserMapping[] = Object.entries(draft)
-      .filter(([, v]) => v.zohoUserId.trim())
-      .map(([pid, v]) => ({
-        paperclipUserId: pid,
-        zohoUserId: v.zohoUserId.trim(),
-        displayName: v.displayName.trim() || undefined,
-        enabled: v.enabled,
-      }));
-    await saveAction({ mappings: merged });
+  const cliqUsers = cliqUsersData?.users ?? [];
+  const pcUsers = pcUsersData?.users ?? [];
+  const cliqLabel = (id: string) => cliqUsers.find((u) => u.id === id)?.name ?? id;
+
+  async function persist(nextEnabled: boolean, nextMappings: ChannelUserMapping[]) {
+    await save({ serviceId, config: { enabled: nextEnabled, mappings: nextMappings } });
     refresh();
+  }
+  async function toggle() { const v = !enabled; setEnabled(v); await persist(v, mappings); }
+  async function addMapping() {
+    if (!newPc || !newCliq) return;
+    const next = [
+      ...mappings.filter((m) => m.paperclipUserId !== newPc),
+      { paperclipUserId: newPc, channelUserId: newCliq, label: cliqLabel(newCliq), enabled: true },
+    ];
+    setMappings(next); setNewPc(""); setNewCliq("");
+    await persist(enabled, next);
+  }
+  async function removeMapping(pid: string) {
+    const next = mappings.filter((m) => m.paperclipUserId !== pid);
+    setMappings(next);
+    await persist(enabled, next);
   }
 
   return (
     <div style={section}>
-      <h3 style={{ marginTop: 0 }}>User Identity Mapping</h3>
-      <p style={muted}>
-        Link Paperclip users to Zoho Cliq users so approvals, blocked items, and
-        notifications reach the right person. Every Paperclip user should have a
-        Cliq user; the reverse is not required.
-      </p>
-      <div style={{ ...row, marginBottom: "0.75rem" }}>
-        <select style={selectStyle} value={companyId} onChange={(e) => setCompanyId(e.target.value)}>
-          <option value="">Select company…</option>
-          {companies.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
-        </select>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "0.25rem" }}>
+        <h4 style={{ margin: 0 }}>Paperclip → User Notifications</h4>
+        <label style={{ ...muted, display: "flex", alignItems: "center", gap: 4 }}>
+          <input type="checkbox" checked={enabled} onChange={toggle} /> enabled
+        </label>
       </div>
+      <p style={muted}>
+        When on, Paperclip events (approvals, blocked items) are sent to the mapped
+        Cliq user. Map a Paperclip user to their Cliq account below.
+      </p>
 
-      {companyId && users.length === 0 && <p style={muted}>No users found for this company.</p>}
+      {enabled && (
+        <>
+          {mappings.map((m) => (
+            <div key={m.paperclipUserId} style={{ ...row, padding: "4px 0" }}>
+              <code style={{ ...muted, flex: 1, fontSize: 11 }} title={m.paperclipUserId}>
+                {m.paperclipUserId.slice(0, 14)}…
+              </code>
+              <span style={muted}>→</span>
+              <span style={{ flex: 1, fontSize: 13 }}>{m.label ?? cliqLabel(m.channelUserId)}</span>
+              <button type="button" style={btnSmallDanger} onClick={() => removeMapping(m.paperclipUserId)}>x</button>
+            </div>
+          ))}
 
-      {users.map((u) => {
-        const d = draft[u.principalId] ?? { zohoUserId: "", displayName: "", enabled: true };
-        return (
-          <div key={u.principalId} style={{ ...row, flexWrap: "wrap" }}>
-            <code style={{ ...muted, minWidth: 220, fontSize: 11 }} title={u.principalId}>
-              {u.principalId} <span>({u.membershipRole ?? "member"})</span>
-            </code>
-            <input
-              style={{ ...inputStyle, minWidth: 150 }}
-              value={d.zohoUserId}
-              onChange={(e) => set(u.principalId, { zohoUserId: e.target.value })}
-              placeholder="Zoho Cliq user id"
-            />
-            <input
-              style={{ ...inputStyle, minWidth: 120 }}
-              value={d.displayName}
-              onChange={(e) => set(u.principalId, { displayName: e.target.value })}
-              placeholder="Label (optional)"
-            />
-            <label style={{ ...muted, display: "flex", alignItems: "center", gap: 4 }}>
-              <input type="checkbox" checked={d.enabled} onChange={(e) => set(u.principalId, { enabled: e.target.checked })} />
-              enabled
-            </label>
+          <div style={{ ...row, marginTop: "0.5rem", flexWrap: "wrap" }}>
+            <select style={selectStyle} value={companyId} onChange={(e) => { setCompanyId(e.target.value); setNewPc(""); }}>
+              <option value="">Company…</option>
+              {companies.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
+            </select>
+            <select style={selectStyle} value={newPc} onChange={(e) => setNewPc(e.target.value)} disabled={!companyId}>
+              <option value="">Paperclip user…</option>
+              {pcUsers.map((u) => (
+                <option key={u.principalId} value={u.principalId}>
+                  {u.principalId.slice(0, 10)}… ({u.membershipRole ?? "member"})
+                </option>
+              ))}
+            </select>
+            <select style={selectStyle} value={newCliq} onChange={(e) => setNewCliq(e.target.value)}>
+              <option value="">{cliqUsers.length ? "Cliq user…" : "Cliq user id…"}</option>
+              {cliqUsers.map((u) => <option key={u.id} value={u.id}>{u.name}</option>)}
+            </select>
+            {cliqUsers.length === 0 && (
+              <input style={{ ...inputStyle, minWidth: 150 }} value={newCliq} onChange={(e) => setNewCliq(e.target.value)} placeholder="Cliq user id" />
+            )}
+            <button type="button" style={btnPrimary} onClick={addMapping} disabled={!newPc || !newCliq}>+ Add</button>
           </div>
-        );
-      })}
-
-      {companyId && users.length > 0 && (
-        <div style={btnGroup}>
-          <button type="button" style={btnPrimary} onClick={save}>Save mappings</button>
-        </div>
+        </>
       )}
     </div>
   );
@@ -898,8 +909,6 @@ export function AgentChannelsSettingsPage(_props: PluginSettingsPageProps) {
           );
         })}
       </div>
-
-      <UserMappingPanel />
     </div>
   );
 }

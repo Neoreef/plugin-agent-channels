@@ -347,6 +347,36 @@ export async function deleteCliqMessage(
   );
 }
 
+// ─── List org users (for the notification user picker) ───────────────────────
+
+export type CliqUser = { id: string; name: string; email?: string };
+
+/** Best-effort list of Zoho Cliq org users. Returns [] on error/empty. */
+export async function listCliqUsers(ctx: PluginContext): Promise<CliqUser[]> {
+  const { status, data } = await cliqFetch(ctx, "GET", "/users", undefined);
+  if (status < 200 || status >= 300) {
+    ctx.logger.info(`listCliqUsers: HTTP ${status}`);
+    return [];
+  }
+  const rows = (data as { data?: unknown[] } | undefined)?.data ?? (Array.isArray(data) ? data : []);
+  return (rows as Array<Record<string, unknown>>)
+    .map((u): CliqUser | null => {
+      const id = u.id ?? u.user_id ?? u.zuid;
+      if (id == null) return null;
+      const first = typeof u.first_name === "string" ? u.first_name : "";
+      const last = typeof u.last_name === "string" ? u.last_name : "";
+      const name =
+        (typeof u.name === "string" && u.name) ||
+        [first, last].filter(Boolean).join(" ") ||
+        (typeof u.email === "string" ? u.email : "") ||
+        String(id);
+      const user: CliqUser = { id: String(id), name };
+      if (typeof u.email === "string") user.email = u.email;
+      return user;
+    })
+    .filter((u): u is CliqUser => u !== null);
+}
+
 // ─── Chunked send ────────────────────────────────────────────────────────────
 
 export async function sendCliqMessageChunked(
