@@ -14,7 +14,7 @@ const manifest: PaperclipPluginManifestV1 = {
   version: PLUGIN_VERSION,
   displayName: "Agent Channels",
   description:
-    "Routes Paperclip agent conversations through everyday messaging channels. Users DM a bot, the plugin routes to an agent session, and streams the response back via message edits. Starts with Zoho Cliq, extensible to Teams, Discord, Slack.",
+    "Connects Paperclip Agents to users through everyday messaging channels. The plugin uses agent configurations to expose routes to an agent harness, and streams the response back. Platforms supported: Zoho Cliq, Teams, Discord, Slack.",
   author: "Neoreef",
   categories: ["connector", "automation"],
   capabilities: [

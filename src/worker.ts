@@ -20,7 +20,6 @@ import type { DataCenterKey } from "./constants.js";
 import type { ZohoAuthState, BotAgentMapping } from "./lib/types.js";
 import { proactiveServiceTokenRefresh } from "./lib/cliq-client.js";
 import { handleCliqWebhook } from "./modules/cliq/webhook-handler.js";
-import { runAgentChat } from "./lib/harness.js";
 import { getBotMappings, saveBotMappings } from "./modules/cliq/bot-mapping.js";
 
 let currentContext: PluginContext | null = null;
@@ -245,39 +244,6 @@ const plugin: PaperclipPlugin = definePlugin({
     });
 
     // ─── Action Handlers ─────────────────────────────────────
-
-    // Ask an agent a plain prompt via a session, streaming events over SSE.
-    ctx.actions.register("ask-agent", async (params) => {
-      const { agentId, companyId, prompt } = params as {
-        agentId: string; companyId: string; prompt: string;
-      };
-
-      const channel = `agent:${agentId}`;
-      ctx.streams.open(channel, companyId);
-
-      // Direct harness invoke (conversational turn). The Paperclip heartbeat
-      // path drops free-form prompts, so we drive the harness directly.
-      const result = await runAgentChat(
-        ctx,
-        { agentId, companyId },
-        {
-          prompt,
-          onText: (textSoFar) => {
-            ctx.streams.emit(channel, { type: "chunk", text: textSoFar });
-          },
-        },
-      );
-
-      ctx.streams.emit(channel, {
-        type: result.error ? "error" : "done",
-        text: result.error ? result.error : result.text,
-      });
-      ctx.streams.close(channel);
-      ctx.logger.info(
-        `[ask-agent] agent=${agentId} textLen=${result.text.length} session=${result.sessionId ?? "-"} error=${result.error ?? "-"} preview="${result.text.slice(0, 160).replace(/\n/g, "\\n")}"`,
-      );
-      return { sessionId: result.sessionId, error: result.error, text: result.text };
-    });
 
     ctx.actions.register("save-bot-mappings", async (params) => {
       const mappings = params.mappings as BotAgentMapping[];

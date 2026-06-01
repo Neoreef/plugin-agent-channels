@@ -2,7 +2,6 @@ import { useState, useCallback, useEffect, useRef, type CSSProperties } from "re
 import {
   usePluginAction,
   usePluginData,
-  usePluginStream,
   type PluginSettingsPageProps,
 } from "@paperclipai/plugin-sdk/ui";
 
@@ -703,75 +702,6 @@ function ComingSoonConfig({ serviceDef }: { serviceDef: ServiceDef }) {
   );
 }
 
-// ─── Agent Chat (SDK two-way-chat sample, as documented) ────────────────────
-
-interface AgentEvent {
-  type: "chunk" | "done" | "error";
-  text: string;
-}
-
-function AgentChat({ agentId, companyId }: { agentId: string; companyId: string }) {
-  const askAgent = usePluginAction("ask-agent");
-  const { events, connected, close } = usePluginStream<AgentEvent>(`agent:${agentId}`, { companyId });
-  const [prompt, setPrompt] = useState("");
-
-  async function send() {
-    const p = prompt;
-    setPrompt("");
-    await askAgent({ agentId, companyId, prompt: p });
-  }
-
-  return (
-    <div>
-      <div style={{
-        minHeight: 120, maxHeight: 320, overflowY: "auto", border: "1px solid var(--border)",
-        borderRadius: 8, padding: "0.75rem", marginBottom: "0.5rem", fontSize: 13,
-        whiteSpace: "pre-wrap", background: "var(--code-bg, rgba(0,0,0,0.2))",
-      }}>
-        {events.filter((e) => e.type === "chunk").map((e, i) => <span key={i}>{e.text}</span>)}
-        {events.length === 0 && <span style={muted}>No events yet. Send a message.</span>}
-      </div>
-      <div style={row}>
-        <input style={inputStyle} value={prompt} onChange={(e) => setPrompt(e.target.value)} placeholder="Message the agent..." />
-        <button type="button" style={btnPrimary} onClick={send} disabled={!prompt}>Send</button>
-        {connected && <button type="button" style={btnDanger} onClick={close}>Stop</button>}
-      </div>
-      <p style={{ ...muted, marginTop: 4 }}>stream connected: {String(connected)} · events: {events.length}</p>
-    </div>
-  );
-}
-
-function AgentChatPanel() {
-  const { data: companiesData } = usePluginData<{ companies: IdName[] }>("paperclip-companies");
-  const [companyId, setCompanyId] = useState("");
-  const { data: agentsData } = usePluginData<{ agents: IdName[] }>(
-    "paperclip-agents",
-    companyId ? { companyId } : undefined,
-  );
-  const [agentId, setAgentId] = useState("");
-
-  const companies = companiesData?.companies ?? [];
-  const agents = agentsData?.agents ?? [];
-
-  return (
-    <div style={section}>
-      <h3 style={{ marginTop: 0 }}>Agent Chat (test)</h3>
-      <p style={muted}>Two-way chat session with an agent — testing the documented SDK sample.</p>
-      <div style={{ ...row, marginBottom: "0.75rem" }}>
-        <select style={selectStyle} value={companyId} onChange={(e) => { setCompanyId(e.target.value); setAgentId(""); }}>
-          <option value="">Select company...</option>
-          {companies.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
-        </select>
-        <select style={selectStyle} value={agentId} onChange={(e) => setAgentId(e.target.value)} disabled={!companyId}>
-          <option value="">Select agent...</option>
-          {agents.map((a) => <option key={a.id} value={a.id}>{a.name}</option>)}
-        </select>
-      </div>
-      {agentId && companyId && <AgentChat agentId={agentId} companyId={companyId} />}
-    </div>
-  );
-}
-
 // ─── Main Settings Page ─────────────────────────────────────────────────────
 
 export function AgentChannelsSettingsPage(_props: PluginSettingsPageProps) {
@@ -817,7 +747,6 @@ export function AgentChannelsSettingsPage(_props: PluginSettingsPageProps) {
 
   return (
     <div style={{ padding: "1.5rem", maxWidth: 850 }}>
-      <AgentChatPanel />
       <div style={section}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "0.75rem" }}>
           <h3 style={{ margin: 0 }}>Messaging Channels</h3>
