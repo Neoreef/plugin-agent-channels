@@ -17,6 +17,7 @@
  */
 
 import { spawn } from "node:child_process";
+import { readdirSync, readFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { PluginContext } from "@paperclipai/plugin-sdk";
@@ -103,6 +104,48 @@ function managedCompanyHome(companyId: string, leaf: string): string {
     asString(process.env.PAPERCLIP_HOME) ?? path.resolve(os.homedir(), ".paperclip");
   const instanceId = asString(process.env.PAPERCLIP_INSTANCE_ID) ?? "default";
   return path.resolve(paperclipHome, "instances", instanceId, "companies", companyId, leaf);
+}
+
+/**
+ * Read an agent's persona from the bundle Paperclip already materializes at
+ * `adapterConfig.instructionsRootPath` (AGENTS.md / SOUL.md / *.md). The worker
+ * reads it via fs — no core change. Empty string when the agent has no bundle.
+ */
+export function readPersona(adapterConfig: Record<string, unknown>): string {
+  const root = asString(adapterConfig.instructionsRootPath);
+  if (!root) return "";
+  let files: string[];
+  try {
+    files = readdirSync(root).filter((f) => f.toLowerCase().endsWith(".md")).sort();
+  } catch {
+    return "";
+  }
+  // SOUL/AGENTS first when present, then the rest, for a stable persona order.
+  const rank = (f: string) => (/soul/i.test(f) ? 0 : /agents?/i.test(f) ? 1 : 2);
+  files.sort((a, b) => rank(a) - rank(b) || a.localeCompare(b));
+  const parts: string[] = [];
+  for (const f of files) {
+    try {
+      const body = readFileSync(path.join(root, f), "utf8").trim();
+      if (body) parts.push(body);
+    } catch { /* skip unreadable file */ }
+  }
+  return parts.join("\n\n").trim();
+}
+
+/** Frame persona + the user's message into a single turn for headless CLIs. */
+function composePrompt(persona: string, userPrompt: string): string {
+  if (!persona) return userPrompt;
+  return [
+    "You are operating under the following agent instructions. Stay in character and follow them for this conversation.",
+    "",
+    "<agent_instructions>",
+    persona,
+    "</agent_instructions>",
+    "",
+    "Respond to this message:",
+    userPrompt,
+  ].join("\n");
 }
 
 /** Parse newline-delimited JSON, skipping blank/incomplete/invalid lines. */
@@ -278,8 +321,9 @@ function runHarness(
   opts: RunChatOptions,
 ): Promise<RunChatResult> {
   const home = spec.resolveHome(cfg.adapterConfig, cfg.companyId);
+  const persona = readPersona(cfg.adapterConfig);
   const { args, stdin } = spec.buildArgs({
-    prompt: opts.prompt,
+    prompt: composePrompt(persona, opts.prompt),
     model: asString(cfg.adapterConfig.model),
     provider: asString(cfg.adapterConfig.provider),
     resumeSessionId: opts.resumeSessionId,
