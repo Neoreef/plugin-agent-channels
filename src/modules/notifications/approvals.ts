@@ -18,31 +18,11 @@
 
 import type { PluginContext, PluginEvent } from "@paperclipai/plugin-sdk";
 import { sendCliqMessage, type CliqButton } from "../../lib/cliq-client.js";
-import { getBotMappings } from "../cliq/bot-mapping.js";
-import { resolveZohoUser, resolvePaperclipUser, listPaperclipUsers } from "../identity/user-mapping.js";
+import { resolvePaperclipUser } from "../identity/user-mapping.js";
+import { botForCompany, dmMappedUsers, getNotifyConfig, ownerPrincipalIds } from "./common.js";
 
 // Must match the Deluge button function name shown in the settings UI guide.
 const BTN_ACTION = { type: "invoke.function" as const, data: { name: "agentChannelsCallback" } };
-
-function asString(v: unknown): string | undefined {
-  return typeof v === "string" && v.trim().length > 0 ? v.trim() : undefined;
-}
-
-type NotifyConfig = { apiBase: string; apiToken?: string };
-
-async function getNotifyConfig(ctx: PluginContext): Promise<NotifyConfig> {
-  const cfg = (await ctx.config.get()) as Record<string, unknown>;
-  return {
-    apiBase: asString(cfg.paperclipApiBase) ?? "http://127.0.0.1:3100",
-    apiToken: asString(cfg.paperclipApiToken),
-  };
-}
-
-/** First enabled bot for the company — the sender for notifications. */
-async function botForCompany(ctx: PluginContext, companyId: string): Promise<string | null> {
-  const m = (await getBotMappings(ctx)).find((x) => x.companyId === companyId && x.enabled);
-  return m?.botUniqueName ?? null;
-}
 
 /** DM the company's mapped owner users a card when an approval is created. */
 export async function notifyApprovalCreated(
@@ -64,12 +44,6 @@ export async function notifyApprovalCreated(
   const issueRef = detail.issueIds?.length ? ` on issue ${detail.issueIds[0]}` : "";
   const requester = `${event.actorType ?? "agent"} ${event.actorId ?? ""}`.trim();
 
-  const text =
-    `🔔 *Approval requested*\n` +
-    `Type: ${detail.type ?? "unknown"}${issueRef}\n` +
-    `Requested by: ${requester}\n` +
-    `Approval: \`${approvalId}\``;
-
   const buttons: CliqButton[] = apiToken
     ? [
         { label: "Approve", key: `ac:approve:${approvalId}`, type: "+", action: BTN_ACTION },
@@ -78,19 +52,14 @@ export async function notifyApprovalCreated(
     : [];
   const footer = apiToken ? "" : "\n\n_Decide in Paperclip — no API token configured for in-Cliq actions._";
 
-  // Targets: owner members that have a Zoho mapping.
-  const owners = (await listPaperclipUsers(ctx, companyId)).filter((u) => u.membershipRole === "owner");
-  let delivered = 0;
-  for (const o of owners) {
-    const zoho = await resolveZohoUser(ctx, o.principalId);
-    if (!zoho) continue;
-    try {
-      await sendCliqMessage(ctx, bot, zoho, text + footer, buttons);
-      delivered++;
-    } catch (err) {
-      ctx.logger.error(`approval.created ${approvalId}: send to ${zoho} failed: ${String(err)}`);
-    }
-  }
+  const text =
+    `🔔 *Approval requested*\n` +
+    `Type: ${detail.type ?? "unknown"}${issueRef}\n` +
+    `Requested by: ${requester}\n` +
+    `Approval: \`${approvalId}\`${footer}`;
+
+  const owners = await ownerPrincipalIds(ctx, companyId);
+  const delivered = await dmMappedUsers(ctx, bot, owners, text, buttons);
   ctx.logger.info(`approval.created ${approvalId}: notified ${delivered} owner(s) via bot ${bot}`);
 }
 

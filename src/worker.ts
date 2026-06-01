@@ -27,6 +27,7 @@ import {
   listPaperclipUsers,
 } from "./modules/identity/user-mapping.js";
 import { notifyApprovalCreated } from "./modules/notifications/approvals.js";
+import { notifyIssueBlocked } from "./modules/notifications/blocked.js";
 import type { UserIdentityMapping } from "./lib/types.js";
 
 let currentContext: PluginContext | null = null;
@@ -162,12 +163,20 @@ const plugin: PaperclipPlugin = definePlugin({
       ctx.logger.info("Token refresh job completed");
     });
 
-    // ─── Events: approval notifications → Cliq cards ──────────
+    // ─── Events: approval + blocked-item notifications → Cliq ──
     ctx.events.on("approval.created", async (event) => {
       try {
         await notifyApprovalCreated(ctx, event);
       } catch (err) {
         ctx.logger.error(`approval.created handler failed: ${String(err)}`);
+      }
+    });
+
+    ctx.events.on("issue.relations.updated", async (event) => {
+      try {
+        await notifyIssueBlocked(ctx, event);
+      } catch (err) {
+        ctx.logger.error(`issue.relations.updated handler failed: ${String(err)}`);
       }
     });
 
