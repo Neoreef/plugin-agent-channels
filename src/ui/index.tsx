@@ -702,6 +702,107 @@ function ComingSoonConfig({ serviceDef }: { serviceDef: ServiceDef }) {
   );
 }
 
+// ─── User Identity Mapping (Zoho ↔ Paperclip) ───────────────────────────────
+
+type PaperclipUser = { principalId: string; membershipRole: string | null; status: string };
+type UserMapping = { paperclipUserId: string; zohoUserId: string; displayName?: string; enabled: boolean };
+type UserDraft = { zohoUserId: string; displayName: string; enabled: boolean };
+
+function UserMappingPanel() {
+  const { data: companiesData } = usePluginData<{ companies: IdName[] }>("paperclip-companies");
+  const [companyId, setCompanyId] = useState("");
+  const { data: usersData } = usePluginData<{ users: PaperclipUser[] }>(
+    "paperclip-users",
+    companyId ? { companyId } : undefined,
+  );
+  const { data: mapData, refresh } = usePluginData<{ mappings: UserMapping[] }>("user-mappings");
+  const saveAction = usePluginAction("save-user-mappings");
+
+  const companies = companiesData?.companies ?? [];
+  const users = usersData?.users ?? [];
+
+  // Editable draft keyed by paperclipUserId, seeded from saved mappings.
+  const [draft, setDraft] = useState<Record<string, UserDraft>>({});
+  useEffect(() => {
+    const d: Record<string, UserDraft> = {};
+    for (const m of mapData?.mappings ?? []) {
+      d[m.paperclipUserId] = { zohoUserId: m.zohoUserId, displayName: m.displayName ?? "", enabled: m.enabled };
+    }
+    setDraft(d);
+  }, [mapData]);
+
+  const set = (pid: string, patch: Partial<UserDraft>) =>
+    setDraft((prev) => {
+      const base: UserDraft = prev[pid] ?? { zohoUserId: "", displayName: "", enabled: true };
+      return { ...prev, [pid]: { ...base, ...patch } };
+    });
+
+  async function save() {
+    const merged: UserMapping[] = Object.entries(draft)
+      .filter(([, v]) => v.zohoUserId.trim())
+      .map(([pid, v]) => ({
+        paperclipUserId: pid,
+        zohoUserId: v.zohoUserId.trim(),
+        displayName: v.displayName.trim() || undefined,
+        enabled: v.enabled,
+      }));
+    await saveAction({ mappings: merged });
+    refresh();
+  }
+
+  return (
+    <div style={section}>
+      <h3 style={{ marginTop: 0 }}>User Identity Mapping</h3>
+      <p style={muted}>
+        Link Paperclip users to Zoho Cliq users so approvals, blocked items, and
+        notifications reach the right person. Every Paperclip user should have a
+        Cliq user; the reverse is not required.
+      </p>
+      <div style={{ ...row, marginBottom: "0.75rem" }}>
+        <select style={selectStyle} value={companyId} onChange={(e) => setCompanyId(e.target.value)}>
+          <option value="">Select company…</option>
+          {companies.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
+        </select>
+      </div>
+
+      {companyId && users.length === 0 && <p style={muted}>No users found for this company.</p>}
+
+      {users.map((u) => {
+        const d = draft[u.principalId] ?? { zohoUserId: "", displayName: "", enabled: true };
+        return (
+          <div key={u.principalId} style={{ ...row, flexWrap: "wrap" }}>
+            <code style={{ ...muted, minWidth: 220, fontSize: 11 }} title={u.principalId}>
+              {u.principalId} <span>({u.membershipRole ?? "member"})</span>
+            </code>
+            <input
+              style={{ ...inputStyle, minWidth: 150 }}
+              value={d.zohoUserId}
+              onChange={(e) => set(u.principalId, { zohoUserId: e.target.value })}
+              placeholder="Zoho Cliq user id"
+            />
+            <input
+              style={{ ...inputStyle, minWidth: 120 }}
+              value={d.displayName}
+              onChange={(e) => set(u.principalId, { displayName: e.target.value })}
+              placeholder="Label (optional)"
+            />
+            <label style={{ ...muted, display: "flex", alignItems: "center", gap: 4 }}>
+              <input type="checkbox" checked={d.enabled} onChange={(e) => set(u.principalId, { enabled: e.target.checked })} />
+              enabled
+            </label>
+          </div>
+        );
+      })}
+
+      {companyId && users.length > 0 && (
+        <div style={btnGroup}>
+          <button type="button" style={btnPrimary} onClick={save}>Save mappings</button>
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ─── Main Settings Page ─────────────────────────────────────────────────────
 
 export function AgentChannelsSettingsPage(_props: PluginSettingsPageProps) {
@@ -797,6 +898,8 @@ export function AgentChannelsSettingsPage(_props: PluginSettingsPageProps) {
           );
         })}
       </div>
+
+      <UserMappingPanel />
     </div>
   );
 }
