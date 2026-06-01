@@ -26,6 +26,7 @@ import {
   saveUserMappings,
   listPaperclipUsers,
 } from "./modules/identity/user-mapping.js";
+import { notifyApprovalCreated } from "./modules/notifications/approvals.js";
 import type { UserIdentityMapping } from "./lib/types.js";
 
 let currentContext: PluginContext | null = null;
@@ -159,6 +160,15 @@ const plugin: PaperclipPlugin = definePlugin({
         } catch { /* skip unconnected services */ }
       }
       ctx.logger.info("Token refresh job completed");
+    });
+
+    // ─── Events: approval notifications → Cliq cards ──────────
+    ctx.events.on("approval.created", async (event) => {
+      try {
+        await notifyApprovalCreated(ctx, event);
+      } catch (err) {
+        ctx.logger.error(`approval.created handler failed: ${String(err)}`);
+      }
     });
 
     // ─── Per-service connection status ────────────────────────

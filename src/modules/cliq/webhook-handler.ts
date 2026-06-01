@@ -11,6 +11,7 @@ import { sendCliqMessage } from "../../lib/cliq-client.js";
 import { createCliqDraftStream, type CardKind } from "../../lib/draft-stream.js";
 import { markdownToCliq } from "../../lib/format.js";
 import { runAgentChat } from "../../lib/harness.js";
+import { handleApprovalButton } from "../notifications/approvals.js";
 import type { ActiveQuery } from "../../lib/types.js";
 
 /** Active queries — prevents concurrent sessions per user+agent */
@@ -42,6 +43,8 @@ type CliqWebhookPayload = {
   message?: string;
   text?: string;
   type?: string;
+  // Button callbacks (Deluge agentChannelsButtonCallback): { type, key }
+  key?: string;
 };
 
 export async function handleCliqWebhook(
@@ -78,6 +81,12 @@ export async function handleCliqWebhook(
   if (!userId || !botUniqueName) {
     ctx.logger.error(`Cliq webhook: missing userId or botUniqueName`);
     return;
+  }
+
+  // Button callbacks (Approve/Deny on an approval card) arrive here too.
+  if (payload.type === "button_callback" && payload.key) {
+    const handled = await handleApprovalButton(ctx, payload.key, userId, botUniqueName);
+    if (handled) return;
   }
 
   if (!messageText.trim()) {

@@ -66,6 +66,18 @@ const manifest: PaperclipPluginManifestV1 = {
         description:
           "Full URL for OAuth redirect (e.g. https://cortex.neoreef.com:8443/paperclip/api/plugins/{pluginId}/routes/callback).",
       },
+      paperclipApiBase: {
+        type: "string",
+        title: "Paperclip API Base URL",
+        description:
+          "Base URL the plugin uses to act on approvals (default http://127.0.0.1:3100). Must be on pluginHttpAllowedPrivateHosts.",
+      },
+      paperclipApiToken: {
+        type: "string",
+        title: "Paperclip Board API Token",
+        description:
+          "Board API token (pcp_board_…) used to approve/deny from Cliq. Without it, approval cards are notification-only.",
+      },
     },
   },
   jobs: [
