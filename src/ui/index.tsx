@@ -733,25 +733,45 @@ function ServiceNotifySection({ serviceId, companies }: { serviceId: string; com
     if (notify) { setEnabled(!!notify.enabled); setMappings(notify.mappings ?? []); }
   }, [notify]);
 
+  const [adding, setAdding] = useState(false);
   const [newPc, setNewPc] = useState("");
+  const [newPcLabel, setNewPcLabel] = useState("");
   const [newCliq, setNewCliq] = useState("");
+  const [newCliqLabel, setNewCliqLabel] = useState("");
 
   const cliqUsers = cliqUsersData?.users ?? [];
   const pcUsers = pcUsersData?.users ?? [];
-  const cliqLabel = (id: string) => cliqUsers.find((u) => u.id === id)?.name ?? id;
+  const cliqLabelFor = (id: string) => cliqUsers.find((u) => u.id === id)?.name ?? id;
+  const pcLabelFor = (id: string) => {
+    const u = pcUsers.find((x) => x.principalId === id);
+    return u ? `${u.membershipRole ?? "member"} · ${id.slice(0, 8)}…` : `${id.slice(0, 12)}…`;
+  };
+
+  const pcOptions: AutocompleteOption[] = pcUsers.map((u) => ({
+    id: u.principalId,
+    label: `${u.membershipRole ?? "member"} · ${u.principalId.slice(0, 10)}…`,
+    sublabel: u.principalId,
+  }));
+  const cliqOptions: AutocompleteOption[] = cliqUsers.map((u) => ({
+    id: u.id, label: u.name, sublabel: u.email,
+  }));
 
   async function persist(nextEnabled: boolean, nextMappings: ChannelUserMapping[]) {
     await save({ serviceId, config: { enabled: nextEnabled, mappings: nextMappings } });
     refresh();
   }
   async function toggle() { const v = !enabled; setEnabled(v); await persist(v, mappings); }
+  function resetForm() {
+    setAdding(false); setNewPc(""); setNewPcLabel(""); setNewCliq(""); setNewCliqLabel("");
+  }
   async function addMapping() {
     if (!newPc || !newCliq) return;
     const next = [
       ...mappings.filter((m) => m.paperclipUserId !== newPc),
-      { paperclipUserId: newPc, channelUserId: newCliq, label: cliqLabel(newCliq), enabled: true },
+      { paperclipUserId: newPc, channelUserId: newCliq, label: newCliqLabel || cliqLabelFor(newCliq), enabled: true },
     ];
-    setMappings(next); setNewPc(""); setNewCliq("");
+    setMappings(next);
+    resetForm();
     await persist(enabled, next);
   }
   async function removeMapping(pid: string) {
@@ -764,50 +784,81 @@ function ServiceNotifySection({ serviceId, companies }: { serviceId: string; com
     <div style={section}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "0.25rem" }}>
         <h4 style={{ margin: 0 }}>Paperclip → User Notifications</h4>
-        <label style={{ ...muted, display: "flex", alignItems: "center", gap: 4 }}>
-          <input type="checkbox" checked={enabled} onChange={toggle} /> enabled
-        </label>
+        <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+          {enabled && !adding && (
+            <button type="button" style={btnSmall} onClick={() => setAdding(true)}>+ Add</button>
+          )}
+          <label style={{ ...muted, display: "flex", alignItems: "center", gap: 4 }}>
+            <input type="checkbox" checked={enabled} onChange={toggle} /> enabled
+          </label>
+        </div>
       </div>
       <p style={muted}>
         When on, Paperclip events (approvals, blocked items) are sent to the mapped
-        Cliq user. Map a Paperclip user to their Cliq account below.
+        Cliq user.
       </p>
 
       {enabled && (
         <>
           {mappings.map((m) => (
             <div key={m.paperclipUserId} style={{ ...row, padding: "4px 0" }}>
-              <code style={{ ...muted, flex: 1, fontSize: 11 }} title={m.paperclipUserId}>
-                {m.paperclipUserId.slice(0, 14)}…
-              </code>
+              <span style={{ flex: 1, fontSize: 13 }} title={m.paperclipUserId}>{pcLabelFor(m.paperclipUserId)}</span>
               <span style={muted}>→</span>
-              <span style={{ flex: 1, fontSize: 13 }}>{m.label ?? cliqLabel(m.channelUserId)}</span>
+              <span style={{ flex: 1, fontSize: 13 }}>{m.label ?? cliqLabelFor(m.channelUserId)}</span>
               <button type="button" style={btnSmallDanger} onClick={() => removeMapping(m.paperclipUserId)}>x</button>
             </div>
           ))}
 
-          <div style={{ ...row, marginTop: "0.5rem", flexWrap: "wrap" }}>
-            <select style={selectStyle} value={companyId} onChange={(e) => { setCompanyId(e.target.value); setNewPc(""); }}>
-              <option value="">Company…</option>
-              {companies.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
-            </select>
-            <select style={selectStyle} value={newPc} onChange={(e) => setNewPc(e.target.value)} disabled={!companyId}>
-              <option value="">Paperclip user…</option>
-              {pcUsers.map((u) => (
-                <option key={u.principalId} value={u.principalId}>
-                  {u.principalId.slice(0, 10)}… ({u.membershipRole ?? "member"})
-                </option>
-              ))}
-            </select>
-            <select style={selectStyle} value={newCliq} onChange={(e) => setNewCliq(e.target.value)}>
-              <option value="">{cliqUsers.length ? "Cliq user…" : "Cliq user id…"}</option>
-              {cliqUsers.map((u) => <option key={u.id} value={u.id}>{u.name}</option>)}
-            </select>
-            {cliqUsers.length === 0 && (
-              <input style={{ ...inputStyle, minWidth: 150 }} value={newCliq} onChange={(e) => setNewCliq(e.target.value)} placeholder="Cliq user id" />
-            )}
-            <button type="button" style={btnPrimary} onClick={addMapping} disabled={!newPc || !newCliq}>+ Add</button>
-          </div>
+          {mappings.length === 0 && !adding && (
+            <p style={muted}>No users mapped yet. Click + Add to notify a Paperclip user on Cliq.</p>
+          )}
+
+          {adding && (
+            <div style={{ ...cardStyle, padding: "0.75rem 1rem" }}>
+              <div style={{ ...row, marginBottom: "0.5rem", flexWrap: "wrap" }}>
+                <select style={selectStyle} value={companyId} onChange={(e) => { setCompanyId(e.target.value); setNewPc(""); setNewPcLabel(""); }}>
+                  <option value="">Select company…</option>
+                  {companies.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
+                </select>
+                <div style={{ minWidth: 200 }}>
+                  <Autocomplete
+                    options={pcOptions}
+                    value={newPc}
+                    onChange={(id, label) => { setNewPc(id); setNewPcLabel(label); }}
+                    placeholder={companyId ? "Paperclip user…" : "Select company first"}
+                    disabled={!companyId}
+                  />
+                </div>
+                <span style={muted}>→</span>
+                {cliqOptions.length > 0 ? (
+                  <div style={{ minWidth: 200 }}>
+                    <Autocomplete
+                      options={cliqOptions}
+                      value={newCliq}
+                      onChange={(id, label) => { setNewCliq(id); setNewCliqLabel(label); }}
+                      placeholder="Search Cliq user…"
+                    />
+                  </div>
+                ) : (
+                  <input
+                    style={{ ...inputStyle, minWidth: 180 }}
+                    value={newCliq}
+                    onChange={(e) => { setNewCliq(e.target.value); setNewCliqLabel(""); }}
+                    placeholder="Cliq user id"
+                  />
+                )}
+              </div>
+              <div style={btnGroup}>
+                <button type="button" style={btnPrimary} onClick={addMapping} disabled={!newPc || !newCliq}>Save</button>
+                <button type="button" style={btn} onClick={resetForm}>Cancel</button>
+              </div>
+              {cliqOptions.length === 0 && (
+                <p style={{ ...muted, marginTop: 6, marginBottom: 0 }}>
+                  Cliq user lookup unavailable (needs the users-read scope) — enter the Cliq user id directly.
+                </p>
+              )}
+            </div>
+          )}
         </>
       )}
     </div>

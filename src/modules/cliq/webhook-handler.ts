@@ -8,8 +8,6 @@
 import type { PluginContext } from "@paperclipai/plugin-sdk";
 import { resolveBot } from "./bot-mapping.js";
 import { sendCliqMessage } from "../../lib/cliq-client.js";
-import { createCliqDraftStream, type CardKind } from "../../lib/draft-stream.js";
-import { markdownToCliq } from "../../lib/format.js";
 import { runAgentChat } from "../../lib/harness.js";
 import { handleApprovalButton } from "../notifications/approvals.js";
 import type { ActiveQuery } from "../../lib/types.js";
@@ -130,67 +128,28 @@ export async function handleCliqWebhook(
   ctx.logger.info(`Cliq: ${userName} → ${botUniqueName} (agent=${agentId}): "${messageText.slice(0, 100)}"`);
 
   // Create draft stream for streaming response
-  const stream = createCliqDraftStream({
-    ctx,
-    botName: botUniqueName,
-    userId,
-    agentName: botDisplayName ?? botUniqueName,
-  });
-
-  // Set initial waiting state
-  await stream.setCardState({ kind: "waiting", agentName: botDisplayName });
-
-  // Invoke the agent's harness directly (conversational turn), streaming the
-  // reply into the Cliq draft card. The heartbeat path is unusable here because
-  // its wake renderer is issue-centric and drops free-form prompts.
+  // Invoke the agent's harness directly (conversational turn), then deliver the
+  // reply as a single message. We don't stream/edit-in-place: Cliq returns bot
+  // message ids that don't round-trip through the edit endpoint, leaving the
+  // card stuck on "waiting". The Deluge handler's synchronous "Processing…"
+  // already serves as the wait indicator.
   try {
-    activeQueries.set(key, {
-      userId,
-      agentId,
-      sessionId: "",
-      startedAt: Date.now(),
-    });
+    activeQueries.set(key, { userId, agentId, sessionId: "", startedAt: Date.now() });
 
-    let startedMessage = false;
-    const result = await runAgentChat(
-      ctx,
-      { agentId, companyId },
-      {
-        prompt: messageText,
-        timeoutMs: 300_000,
-        onText: (textSoFar) => {
-          if (!textSoFar) return;
-          if (!startedMessage) {
-            startedMessage = true;
-            void stream.setCardState({ kind: "message", agentName: botDisplayName });
-          }
-          stream.update(textSoFar);
-        },
-      },
-    );
+    const result = await runAgentChat(ctx, { agentId, companyId }, {
+      prompt: messageText,
+      timeoutMs: 300_000,
+    });
 
     ctx.logger.info(
       `[done] agent=${agentId} len=${result.text.length} session=${result.sessionId ?? "-"}${result.error ? ` error=${result.error}` : ""} final="${result.text.slice(0, 200).replace(/\n/g, "\\n")}"`,
     );
 
-    if (!startedMessage) {
-      await stream.setCardState({ kind: "message", agentName: botDisplayName });
-    }
-    if (result.text) {
-      stream.update(result.text);
-      await stream.flush();
-    } else {
-      stream.update(
-        result.error
-          ? `_(No response — ${result.error})_`
-          : "_(No response from agent.)_",
-      );
-      await stream.flush();
-    }
-    await stream.stop();
+    const finalText = result.text
+      || (result.error ? `Sorry — ${result.error}` : "_(No response from agent.)_");
+    await sendCliqMessage(ctx, botUniqueName, userId, finalText);
   } catch (err) {
     ctx.logger.error(`Agent invoke failed: ${String(err)}`);
-    stream.cancel();
     await sendCliqMessage(
       ctx,
       botUniqueName,

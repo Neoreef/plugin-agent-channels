@@ -241,10 +241,20 @@ export type CliqMessageRef = {
 // ─── Message Ref Extraction ──────────────────────────────────────────────────
 
 function extractBotDmMessageRef(data: unknown, userId: string): CliqMessageRef {
-  const details = (data as any)?.message_details?.[userId];
+  const root = ((data as any)?.data ?? data) as any;
+  const md = root?.message_details;
+  // Prefer the entry for this user; fall back to the first entry (DM replies
+  // have a single recipient and Cliq sometimes keys it differently than the
+  // id we sent). Then try a top-level message object as a last resort.
+  let details: any;
+  if (md && typeof md === "object") {
+    details = md[userId] ?? Object.values(md)[0];
+  }
+  details = details ?? root?.message ?? root;
   return {
-    chatId: details?.chat_id ?? undefined,
-    messageId: details?.message_id ?? undefined,
+    chatId: details?.chat_id ?? details?.chatId ?? root?.chat_id ?? undefined,
+    messageId:
+      details?.message_id ?? details?.messageId ?? root?.message_id ?? root?.id ?? undefined,
   };
 }
 
@@ -265,7 +275,6 @@ export async function sendCliqMessage(
   if (buttons && buttons.length > 0) body.buttons = buttons;
 
   const result = await cliqFetch(ctx, "POST", `/bots/${encodeURIComponent(botName)}/message`, body);
-
   if (!result.status || result.status >= 400) {
     ctx.logger.error(`Cliq send failed (${result.status}): ${JSON.stringify(result.data).slice(0, 200)}`);
   }
