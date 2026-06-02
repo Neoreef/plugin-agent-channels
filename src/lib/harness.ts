@@ -96,6 +96,12 @@ interface HarnessSpec {
    * absent, runHarness degrades to emitting text_delta from parseOutput.
    */
   makeStreamParser?(): (line: Record<string, unknown>, emit: (e: HarnessEvent) => void) => void;
+  /**
+   * Optional: a complete alternate runner replacing the default spawn+parse
+   * (e.g. hermes' ACP JSON-RPC protocol, which is interactive rather than
+   * one-shot). When present, runAgentChat calls this instead of runHarness.
+   */
+  runner?(cfg: AgentInvokeConfig, opts: RunChatOptions): Promise<RunChatResult>;
 }
 
 // ── helpers ────────────────────────────────────────────────────────────────
@@ -376,6 +382,9 @@ export const HARNESS_REGISTRY: Record<string, HarnessSpec> = {
       return { args };
     },
     parseOutput: parseHermes,
+    // hermes' `chat` has no structured event stream; its ACP mode (JSON-RPC)
+    // does. Prefer ACP for rich reasoning/tool cards; fall back to chat -Q.
+    runner: runHermes,
   },
 
   claude_local: {
@@ -425,6 +434,222 @@ export const HARNESS_REGISTRY: Record<string, HarnessSpec> = {
     parseOutput: parseGemini,
   },
 };
+
+// ── hermes ACP runner ─────────────────────────────────────────────────────────
+
+/** Extract text from an ACP content block (string, {type:text,text}, or array). */
+function textOfContent(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) return content.map(textOfContent).join("");
+  if (content && typeof content === "object") return asString((content as Record<string, unknown>).text) ?? "";
+  return "";
+}
+
+/**
+ * Pick the model id to set on an ACP session. Unlike `chat`, an ACP session
+ * does NOT apply hermes' built-in default — with no config.yaml in the managed
+ * home the session model is empty, which 404s the provider. So we set one
+ * explicitly: the agent's configured model, else an env override, else the best
+ * model the agent advertised (prefer a non-"lite" tier), else its current/first.
+ */
+function pickAcpModel(sessionResult: Record<string, unknown> | undefined, cfgModel?: string): string | undefined {
+  if (cfgModel) return cfgModel;
+  const envModel = asString(process.env.HERMES_ACP_MODEL);
+  if (envModel) return envModel;
+  const models = sessionResult?.models as Record<string, unknown> | undefined;
+  const avail = (models?.availableModels as Array<Record<string, unknown>> | undefined) ?? [];
+  const ids = avail.map((m) => asString(m.modelId)).filter((x): x is string => !!x);
+  return ids.find((id) => !/lite/i.test(id)) ?? asString(models?.currentModelId) ?? ids[0];
+}
+
+/** Build a tool-card description from an ACP tool_call update's rawInput. */
+function summarizeAcpTool(u: Record<string, unknown>): string | undefined {
+  const raw = u.rawInput;
+  if (raw && typeof raw === "object") {
+    const name = asString(u.kind) ?? asString(u.title) ?? "tool";
+    return summarizeToolInput(name, raw as Record<string, unknown>);
+  }
+  return undefined;
+}
+
+/**
+ * Run a hermes turn over ACP (Agent Client Protocol) — newline-delimited
+ * JSON-RPC 2.0 on stdio. Sequence: initialize → session/new (or session/load
+ * to resume) → session/prompt, while mapping session/update notifications to
+ * HarnessEvents (agent_thought_chunk → thinking, tool_call → tool_use,
+ * agent_message_chunk → text_delta) and auto-granting permission requests.
+ */
+function runHermesAcp(cfg: AgentInvokeConfig, opts: RunChatOptions): Promise<RunChatResult> {
+  const home = envHome(cfg.adapterConfig, "HOME", "HERMES_HOME")
+    ?? managedCompanyHome(cfg.companyId, "hermes-home");
+  const persona = readPersona(cfg.adapterConfig);
+  const promptText = composePrompt(persona, opts.prompt);
+  const bin = binFor("HERMES_BIN", path.join(os.homedir(), ".local", "bin", "hermes"));
+  const env: Record<string, string> = {
+    ...(process.env as Record<string, string>),
+    HOME: home,
+    HERMES_HOME: home,
+    ...((cfg.adapterConfig.env as Record<string, string> | undefined) ?? {}),
+  };
+  // adapterConfig.env may override HOME; re-pin the hermes home afterward.
+  env.HOME = home;
+  env.HERMES_HOME = home;
+  const cwd = asString(cfg.adapterConfig.cwd) || home;
+
+  return new Promise<RunChatResult>((resolve) => {
+    const child = spawn(bin, ["acp", "--accept-hooks"], { env, cwd, stdio: ["pipe", "pipe", "pipe"] });
+    let settled = false;
+    let answer = "";
+    let thinking = "";
+    let sessionId: string | undefined = opts.resumeSessionId;
+    let stderrTail = "";
+    let lineBuf = "";
+    let nextId = 0;
+    const pending = new Map<number, (msg: Record<string, unknown>) => void>();
+
+    const finish = (r: RunChatResult) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      opts.signal?.removeEventListener("abort", onAbort);
+      try { child.kill("SIGKILL"); } catch { /* ignore */ }
+      resolve(r);
+    };
+    const timer = setTimeout(
+      () => finish({ text: answer.trim(), sessionId, error: "timed_out" }),
+      opts.timeoutMs ?? 300_000,
+    );
+    const onAbort = () => finish({ text: answer.trim(), sessionId, error: "aborted" });
+    opts.signal?.addEventListener("abort", onAbort, { once: true });
+
+    const send = (obj: unknown) => { try { child.stdin?.write(JSON.stringify(obj) + "\n"); } catch { /* ignore */ } };
+    const request = (method: string, params: unknown): Promise<Record<string, unknown>> => {
+      const id = ++nextId;
+      return new Promise((res) => { pending.set(id, res); send({ jsonrpc: "2.0", id, method, params }); });
+    };
+
+    const handleUpdate = (u: Record<string, unknown>) => {
+      switch (asString(u.sessionUpdate)) {
+        case "agent_message_chunk": {
+          const t = textOfContent(u.content);
+          if (t) { answer += t; opts.onText?.(answer); opts.onEvent?.({ type: "text_delta", text: answer }); }
+          break;
+        }
+        case "agent_thought_chunk": {
+          const t = textOfContent(u.content);
+          if (t) { thinking += t; opts.onEvent?.({ type: "thinking", text: thinking }); }
+          break;
+        }
+        case "tool_call": {
+          const name = asString(u.title) ?? asString(u.kind) ?? "tool";
+          opts.onEvent?.({ type: "tool_use", toolName: name, description: summarizeAcpTool(u) });
+          break;
+        }
+        // tool_call_update / plan / usage_update / *_commands_update — not cards
+      }
+    };
+
+    const handleMessage = (msg: Record<string, unknown>) => {
+      const id = msg.id;
+      const method = asString(msg.method);
+      if (method === "session/update") {
+        const u = (msg.params as Record<string, unknown> | undefined)?.update as Record<string, unknown> | undefined;
+        if (u) handleUpdate(u);
+        return;
+      }
+      if (method && (typeof id === "number")) {
+        // Agent → client request needing a response.
+        if (method.includes("request_permission")) {
+          const params = (msg.params as Record<string, unknown> | undefined) ?? {};
+          const options = (params.options as Array<Record<string, unknown>> | undefined) ?? [];
+          const pick = options.find((o) => ["allow_once", "allow_always", "allow"].includes(asString(o.kind) ?? ""))
+            ?? options[0];
+          send({ jsonrpc: "2.0", id, result: { outcome: { outcome: "selected", optionId: pick?.optionId } } });
+        } else {
+          // Unsupported request (e.g. fs/*): refuse so the agent proceeds.
+          send({ jsonrpc: "2.0", id, error: { code: -32601, message: "not supported" } });
+        }
+        return;
+      }
+      if (typeof id === "number" && pending.has(id)) {
+        const res = pending.get(id)!;
+        pending.delete(id);
+        res(msg);
+      }
+    };
+
+    child.stdout?.on("data", (buf: Buffer) => {
+      lineBuf += buf.toString();
+      const parts = lineBuf.split(/\r?\n/);
+      lineBuf = parts.pop() ?? "";
+      for (const line of parts) {
+        const t = line.trim();
+        if (!t) continue;
+        try {
+          const v = JSON.parse(t);
+          if (v && typeof v === "object") handleMessage(v as Record<string, unknown>);
+        } catch { /* partial/non-JSON — skip */ }
+      }
+    });
+    child.stderr?.on("data", (buf: Buffer) => { stderrTail = (stderrTail + buf.toString()).slice(-400); });
+    child.on("error", (err) => finish({ text: "", error: `spawn failed: ${String(err)}` }));
+    child.on("close", (code) => {
+      finish({
+        text: answer.trim(),
+        sessionId,
+        error: answer.trim() ? undefined : `exit ${code}${stderrTail ? `: ${stderrTail}` : ""}`,
+      });
+    });
+
+    // Drive the protocol.
+    void (async () => {
+      try {
+        await request("initialize", {
+          protocolVersion: 1,
+          clientCapabilities: { fs: { readTextFile: false, writeTextFile: false } },
+        });
+        if (sessionId) {
+          const loaded = await request("session/load", { sessionId, cwd, mcpServers: [] });
+          if (loaded.error) sessionId = undefined; // stale id — start fresh
+        }
+        let sessionResult: Record<string, unknown> | undefined;
+        if (!sessionId) {
+          const created = await request("session/new", { cwd, mcpServers: [] });
+          sessionResult = created.result as Record<string, unknown> | undefined;
+          sessionId = asString(sessionResult?.sessionId);
+        }
+        if (!sessionId) { finish({ text: "", error: "acp: no session" }); return; }
+        // ACP sessions start with no model when the managed home has no config;
+        // set one explicitly or the provider 404s on an empty-model URL.
+        const modelId = pickAcpModel(sessionResult, asString(cfg.adapterConfig.model));
+        if (modelId) await request("session/set_model", { sessionId, modelId });
+        const pr = await request("session/prompt", {
+          sessionId,
+          prompt: [{ type: "text", text: promptText }],
+        });
+        const stop = asString((pr.result as Record<string, unknown> | undefined)?.stopReason);
+        finish({
+          text: answer.trim(),
+          sessionId,
+          error: answer.trim() ? undefined : `no_output${stop ? ` (${stop})` : ""}`,
+        });
+      } catch (e) {
+        finish({ text: answer.trim(), sessionId, error: `acp: ${String(e)}` });
+      }
+    })();
+  });
+}
+
+/**
+ * hermes runner: prefer ACP (rich cards), fall back to the reliable one-shot
+ * `chat -Q` path when ACP yields nothing (protects the live agent from any ACP
+ * instability — no rich cards on the fallback, but the answer still lands).
+ */
+async function runHermes(cfg: AgentInvokeConfig, opts: RunChatOptions): Promise<RunChatResult> {
+  const r = await runHermesAcp(cfg, opts);
+  if (r.text) return r;
+  return runHarness(HARNESS_REGISTRY.hermes_local, cfg, opts);
+}
 
 // ── generic runner ───────────────────────────────────────────────────────────
 
@@ -546,5 +771,9 @@ export async function runAgentChat(
   const spec = HARNESS_REGISTRY[adapterType];
   if (!spec) return { text: "", error: `unsupported adapterType: ${adapterType}` };
 
-  return runHarness(spec, { agentId: params.agentId, companyId: params.companyId, adapterType, adapterConfig }, opts);
+  const invokeCfg: AgentInvokeConfig = {
+    agentId: params.agentId, companyId: params.companyId, adapterType, adapterConfig,
+  };
+  if (spec.runner) return spec.runner(invokeCfg, opts);
+  return runHarness(spec, invokeCfg, opts);
 }
