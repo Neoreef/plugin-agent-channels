@@ -128,11 +128,10 @@ export async function handleCliqWebhook(
   ctx.logger.info(`Cliq: ${userName} → ${botUniqueName} (agent=${agentId}): "${messageText.slice(0, 100)}"`);
 
   // Create draft stream for streaming response
-  // Invoke the agent's harness directly (conversational turn), then deliver the
-  // reply as a single message. We don't stream/edit-in-place: Cliq returns bot
-  // message ids that don't round-trip through the edit endpoint, leaving the
-  // card stuck on "waiting". The Deluge handler's synchronous "Processing…"
-  // already serves as the wait indicator.
+  // Post an immediate placeholder, run the harness, then edit the placeholder
+  // in place with the answer. Cliq composite message ids are URL-encoded
+  // (%20); extractBotDmMessageRef decodes them so the edit round-trips. If the
+  // edit still fails, fall back to sending the answer as a new message.
   try {
     activeQueries.set(key, { userId, agentId, sessionId: "", startedAt: Date.now() });
 
@@ -145,6 +144,10 @@ export async function handleCliqWebhook(
       `[done] agent=${agentId} len=${result.text.length} session=${result.sessionId ?? "-"}${result.error ? ` error=${result.error}` : ""} final="${result.text.slice(0, 200).replace(/\n/g, "\\n")}"`,
     );
 
+    // Deliver as a single bot message. Edit-in-place is unavailable: the edit
+    // endpoint returns 401 for bot messages even with Webhooks.UPDATE scope and
+    // the message_id %20 fix (see cliq-client decodeId). Plain delivery is the
+    // reliable path; the Deluge handler's "Processing…" covers the wait.
     const finalText = result.text
       || (result.error ? `Sorry — ${result.error}` : "_(No response from agent.)_");
     await sendCliqMessage(ctx, botUniqueName, userId, finalText);

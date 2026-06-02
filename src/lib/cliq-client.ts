@@ -240,6 +240,17 @@ export type CliqMessageRef = {
 
 // ─── Message Ref Extraction ──────────────────────────────────────────────────
 
+/**
+ * Cliq returns composite ids URL-encoded in JSON (e.g. message_id
+ * "1780350234100%2045183446516" — a `<time> <seq>` pair). Decode here so the
+ * edit endpoint can re-encode it correctly; otherwise encodeURIComponent turns
+ * the "%" into "%25" and the edit URL 404s.
+ */
+function decodeId(v: unknown): string | undefined {
+  if (typeof v !== "string" || v.length === 0) return undefined;
+  try { return decodeURIComponent(v); } catch { return v; }
+}
+
 function extractBotDmMessageRef(data: unknown, userId: string): CliqMessageRef {
   const root = ((data as any)?.data ?? data) as any;
   const md = root?.message_details;
@@ -252,9 +263,8 @@ function extractBotDmMessageRef(data: unknown, userId: string): CliqMessageRef {
   }
   details = details ?? root?.message ?? root;
   return {
-    chatId: details?.chat_id ?? details?.chatId ?? root?.chat_id ?? undefined,
-    messageId:
-      details?.message_id ?? details?.messageId ?? root?.message_id ?? root?.id ?? undefined,
+    chatId: decodeId(details?.chat_id ?? details?.chatId ?? root?.chat_id),
+    messageId: decodeId(details?.message_id ?? details?.messageId ?? root?.message_id ?? root?.id),
   };
 }
 
@@ -308,6 +318,27 @@ export async function sendCliqCardMessage(
 
   const result = await cliqFetch(ctx, "POST", `/bots/${encodeURIComponent(botName)}/message`, body);
   return { status: result.status, ref: extractBotDmMessageRef(result.data, userId) };
+}
+
+// ─── Send into a chat (editable: same endpoint family as edit) ───────────────
+
+/**
+ * Post a message into a chat by id (the chat the user DMed the bot in, from the
+ * webhook's chat.id). Unlike /bots/{bot}/message, a message posted here can be
+ * edited via PUT /chats/{id}/messages/{messageId} (both use Webhooks scopes).
+ */
+export async function sendCliqChatMessage(
+  ctx: PluginContext,
+  chatId: string,
+  text: string,
+  opts?: { buttons?: CliqButton[] },
+): Promise<{ status: number; ref: CliqMessageRef }> {
+  const body: Record<string, unknown> = { text: markdownToCliq(text), sync_message: true };
+  if (opts?.buttons && opts.buttons.length > 0) body.buttons = opts.buttons;
+
+  const result = await cliqFetch(ctx, "POST", `/chats/${encodeURIComponent(chatId)}/message`, body);
+  const messageId = extractBotDmMessageRef(result.data, "").messageId;
+  return { status: result.status, ref: { chatId, messageId } };
 }
 
 // ─── Edit message ────────────────────────────────────────────────────────────
