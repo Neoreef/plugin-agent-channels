@@ -532,7 +532,8 @@ function summarizeAcpTool(u: Record<string, unknown>): string | undefined {
 function runHermesAcp(cfg: AgentInvokeConfig, opts: RunChatOptions): Promise<RunChatResult> {
   const home = envHome(cfg.adapterConfig, "HOME", "HERMES_HOME")
     ?? managedCompanyHome(cfg.companyId, "hermes-home");
-  const persona = readPersona(cfg.adapterConfig);
+  // Inject persona only on a fresh turn; a resumed ACP session already has it.
+  const persona = opts.resumeSessionId ? "" : readPersona(cfg.adapterConfig);
   const promptText = composePrompt(persona, opts.prompt);
   const bin = binFor("HERMES_BIN", path.join(os.homedir(), ".local", "bin", "hermes"));
   const env: Record<string, string> = {
@@ -551,6 +552,10 @@ function runHermesAcp(cfg: AgentInvokeConfig, opts: RunChatOptions): Promise<Run
     let settled = false;
     let answer = "";
     let thinking = "";
+    // session/load replays prior turns as session/update BEFORE responding, so
+    // ignore all updates until we've sent the prompt — otherwise the replayed
+    // history contaminates the answer (and flickers the card).
+    let live = false;
     let sessionId: string | undefined = opts.resumeSessionId;
     let stderrTail = "";
     let lineBuf = "";
@@ -579,6 +584,7 @@ function runHermesAcp(cfg: AgentInvokeConfig, opts: RunChatOptions): Promise<Run
     };
 
     const handleUpdate = (u: Record<string, unknown>) => {
+      if (!live) return; // suppress session/load replay (history, not this turn)
       switch (asString(u.sessionUpdate)) {
         case "agent_message_chunk": {
           const t = textOfContent(u.content);
@@ -673,6 +679,7 @@ function runHermesAcp(cfg: AgentInvokeConfig, opts: RunChatOptions): Promise<Run
         // set one explicitly or the provider 404s on an empty-model URL.
         const modelId = pickAcpModel(sessionResult, asString(cfg.adapterConfig.model));
         if (modelId) await request("session/set_model", { sessionId, modelId });
+        live = true; // replay (if any) is done; updates from here are this turn
         const pr = await request("session/prompt", {
           sessionId,
           prompt: [{ type: "text", text: promptText }],
@@ -709,7 +716,8 @@ function runHarness(
   opts: RunChatOptions,
 ): Promise<RunChatResult> {
   const home = spec.resolveHome(cfg.adapterConfig, cfg.companyId);
-  const persona = readPersona(cfg.adapterConfig);
+  // Inject persona only on a fresh turn; a resumed session already has it.
+  const persona = opts.resumeSessionId ? "" : readPersona(cfg.adapterConfig);
   const { args, stdin } = spec.buildArgs({
     prompt: composePrompt(persona, opts.prompt),
     model: asString(cfg.adapterConfig.model),

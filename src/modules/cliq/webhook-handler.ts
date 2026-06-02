@@ -14,6 +14,7 @@ import {
 } from "../../lib/cliq-client.js";
 import { runAgentChat, type HarnessEvent } from "../../lib/harness.js";
 import { createCliqDraftStream } from "../../lib/draft-stream.js";
+import { getResumeSession, saveSession } from "./session-store.js";
 import { handleApprovalButton } from "../notifications/approvals.js";
 import type { ActiveQuery } from "../../lib/types.js";
 
@@ -194,6 +195,9 @@ async function runChatInBackground(
   const { key, chatId, botUniqueName, userId, agentId, companyId, messageText } = args;
   const editable = chatId ? getChatEditCapability(chatId) : null;
 
+  // Resume this user's prior session with this agent for multi-turn memory.
+  const resumeSessionId = await getResumeSession(ctx, userId, agentId);
+
   try {
     // Known non-editable chat: no streaming possible — run to completion and
     // deliver once as a plain message.
@@ -201,8 +205,10 @@ async function runChatInBackground(
       const result = await runAgentChat(ctx, { agentId, companyId }, {
         prompt: messageText,
         timeoutMs: 300_000,
+        resumeSessionId,
       });
       logDone(ctx, agentId, result);
+      await saveSession(ctx, userId, agentId, result.sessionId);
       await sendCliqMessage(ctx, botUniqueName, userId, finalTextOf(result));
       return;
     }
@@ -237,8 +243,10 @@ async function runChatInBackground(
       prompt: messageText,
       timeoutMs: 300_000,
       onEvent,
+      resumeSessionId,
     });
     logDone(ctx, agentId, result);
+    await saveSession(ctx, userId, agentId, result.sessionId);
 
     // Finalize: render the authoritative final text and stop the stream.
     const finalText = finalTextOf(result);
