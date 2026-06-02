@@ -322,6 +322,54 @@ function makeClaudeStreamParser(): (line: Record<string, unknown>, emit: (e: Har
   };
 }
 
+/**
+ * Gemini `--output-format stream-json` mapper. Events are whole messages, not
+ * token deltas: `message`{role,content} (assistant text — accumulate),
+ * `tool_use`{tool_name,parameters} → tool_use. init/tool_result/result ignored.
+ */
+function makeGeminiStreamParser(): (line: Record<string, unknown>, emit: (e: HarnessEvent) => void) => void {
+  let answer = "";
+  return (e, emit) => {
+    const type = asString(e.type);
+    if (type === "message" && asString(e.role) !== "user") {
+      const t = textOfContent(e.content) || (asString(e.text) ?? "");
+      if (t) { answer += t; emit({ type: "text_delta", text: answer }); }
+    } else if (type === "tool_use") {
+      const name = asString(e.tool_name) ?? "tool";
+      const params = e.parameters;
+      const desc = params && typeof params === "object"
+        ? summarizeToolInput(name, params as Record<string, unknown>)
+        : undefined;
+      emit({ type: "tool_use", toolName: name, description: desc });
+    }
+  };
+}
+
+/**
+ * Codex `exec --json` mapper (best-effort; no local codex CLI to verify live).
+ * item.{started,updated,completed} carry an item by type: agent_message (answer
+ * — full text), reasoning (thinking), command_execution/*_call (tool).
+ */
+function makeCodexStreamParser(): (line: Record<string, unknown>, emit: (e: HarnessEvent) => void) => void {
+  let answer = "";
+  return (e, emit) => {
+    const type = asString(e.type);
+    if (!type || !type.startsWith("item")) return;
+    const item = (e.item as Record<string, unknown> | undefined) ?? {};
+    const itype = asString(item.type);
+    if (itype === "agent_message") {
+      const t = asString(item.text);
+      if (t) { answer = t; emit({ type: "text_delta", text: answer }); }
+    } else if (itype === "reasoning") {
+      const t = asString(item.text);
+      if (t) emit({ type: "thinking", text: t });
+    } else if (itype && (itype.includes("command") || itype.includes("call") || itype.includes("exec"))) {
+      const name = itype.includes("command") ? "Shell" : (asString(item.name) ?? "tool");
+      emit({ type: "tool_use", toolName: name, description: asString(item.command) ?? asString(item.name) });
+    }
+  };
+}
+
 /** Codex `exec --json`: thread.started + item.completed(agent_message) events. */
 export function parseCodex(raw: string): ParsedOutput {
   let sessionId: string | undefined;
@@ -417,6 +465,7 @@ export const HARNESS_REGISTRY: Record<string, HarnessSpec> = {
       return { args, stdin: prompt };
     },
     parseOutput: parseCodex,
+    makeStreamParser: makeCodexStreamParser,
   },
 
   gemini_local: {
@@ -432,6 +481,7 @@ export const HARNESS_REGISTRY: Record<string, HarnessSpec> = {
       return { args };
     },
     parseOutput: parseGemini,
+    makeStreamParser: makeGeminiStreamParser,
   },
 };
 
