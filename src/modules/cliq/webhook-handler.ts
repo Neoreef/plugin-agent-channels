@@ -132,20 +132,63 @@ export async function handleCliqWebhook(
 
   ctx.logger.info(`Cliq: ${userName} → ${botUniqueName} (agent=${agentId}): "${messageText.slice(0, 100)}"`);
 
-  // Create draft stream for streaming response
-  // Post an immediate placeholder, run the harness, then edit the placeholder
-  // in place with the answer. Cliq composite message ids are URL-encoded
-  // (%20); extractBotDmMessageRef decodes them so the edit round-trips. If the
-  // edit still fails, fall back to sending the answer as a new message.
   const chatId = (payload.chat as { id?: string } | undefined)?.id;
+
+  // Mark active BEFORE returning so a rapid follow-up message hits the
+  // concurrent-query guard above.
+  activeQueries.set(key, { userId, agentId, sessionId: "", startedAt: Date.now() });
+
+  // CRITICAL: do NOT await the harness here. The host's webhook RPC has a ~30s
+  // budget, but an agent turn (persona + tools + model latency) routinely runs
+  // longer. Awaiting it inside onWebhook makes the RPC time out at 30s (502)
+  // while the harness keeps running orphaned. Instead we detach the work: the
+  // webhook returns immediately and the reply is delivered later via the Cliq
+  // API (bot message / edit-in-place), which works any time the worker is alive.
+  void runChatInBackground(ctx, {
+    key,
+    chatId,
+    botUniqueName,
+    userId,
+    agentId,
+    companyId,
+    messageText,
+  }).catch((err) => {
+    ctx.logger.error(`Cliq background chat crashed: ${String(err)}`);
+    activeQueries.delete(key);
+  });
+}
+
+type BackgroundChatArgs = {
+  key: string;
+  chatId: string | undefined;
+  botUniqueName: string;
+  userId: string;
+  agentId: string;
+  companyId: string;
+  messageText: string;
+};
+
+/**
+ * Runs the agent turn and delivers the reply. Detached from the webhook RPC so
+ * long turns don't blow the host's 30s webhook budget.
+ *
+ * Posts an immediate placeholder, runs the harness, then edits the placeholder
+ * in place with the answer. Cliq composite message ids are URL-encoded (%20);
+ * extractBotDmMessageRef decodes them so the edit round-trips. If the edit
+ * fails, falls back to sending the answer as a new message.
+ */
+async function runChatInBackground(
+  ctx: PluginContext,
+  args: BackgroundChatArgs,
+): Promise<void> {
+  const { key, chatId, botUniqueName, userId, agentId, companyId, messageText } = args;
+
   // Edit-in-place works for most chats but 401/403s for some users/grants. We
   // probe per chat (first edit) + cache; show an editable "Thinking…"
   // placeholder only when edits may work, and degrade to a plain send otherwise.
   const editable = chatId ? getChatEditCapability(chatId) : false;
 
   try {
-    activeQueries.set(key, { userId, agentId, sessionId: "", startedAt: Date.now() });
-
     const placeholder = chatId && editable !== false
       ? await sendCliqMessage(ctx, botUniqueName, userId, "_Thinking…_")
       : null;

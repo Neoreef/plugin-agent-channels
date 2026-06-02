@@ -364,10 +364,11 @@ function runHarness(
     const onAbort = () => { try { child.kill("SIGKILL"); } catch { /* ignore */ } };
     opts.signal?.addEventListener("abort", onAbort, { once: true });
 
-    if (stdin !== undefined) {
-      child.stdin?.write(stdin);
-      child.stdin?.end();
-    }
+    // Always close stdin. Harnesses that take the prompt via argv (hermes,
+    // gemini) will otherwise block reading an open stdin pipe that never EOFs
+    // (it works manually only because a terminal stdin is interactive).
+    if (stdin !== undefined) child.stdin?.write(stdin);
+    child.stdin?.end();
 
     child.stdout?.on("data", (buf: Buffer) => {
       raw += buf.toString();

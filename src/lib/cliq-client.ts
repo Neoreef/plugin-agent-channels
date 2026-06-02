@@ -188,11 +188,27 @@ async function cliqFetch(
     "Content-Type": "application/json",
   };
 
-  let res = await ctx.http.fetch(fullUrl, {
+  // Cliq returns 204 No Content for successful edits/deletes. The host's worker
+  // RPC bridge builds `new Response(body, { status })`, which throws for a
+  // no-content status (204/205/304) carrying a body. Treat that as a successful
+  // empty response instead of letting it surface as an error.
+  const NO_CONTENT_RE = /invalid response status code\s*(204|205|304)/i;
+  const httpFetch = async (init: RequestInit): Promise<Response> => {
+    try {
+      return await ctx.http.fetch(fullUrl, init);
+    } catch (e) {
+      const m = String((e as Error)?.message ?? e).match(NO_CONTENT_RE);
+      if (m) return { status: Number(m[1]), headers: new Headers(), text: async () => "" } as Response;
+      throw e;
+    }
+  };
+  const init: RequestInit = {
     method,
     headers,
     body: body != null ? JSON.stringify(body) : undefined,
-  });
+  };
+
+  let res = await httpFetch(init);
 
   if (res.status === 429) {
     recordLockout(10 * 60_000);
@@ -202,11 +218,7 @@ async function cliqFetch(
   if (res.status === 401) {
     const newToken = await refreshAccessToken(ctx);
     headers.Authorization = `Zoho-oauthtoken ${newToken}`;
-    res = await ctx.http.fetch(fullUrl, {
-      method,
-      headers,
-      body: body != null ? JSON.stringify(body) : undefined,
-    });
+    res = await httpFetch({ ...init, headers });
     if (res.status === 429) recordLockout(10 * 60_000);
   }
 
