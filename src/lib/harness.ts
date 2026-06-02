@@ -30,10 +30,26 @@ export interface AgentInvokeConfig {
   adapterConfig: Record<string, unknown>;
 }
 
+/**
+ * Incremental turn events surfaced from a harness's NDJSON stream, normalized
+ * across harnesses. `text` fields carry the FULL accumulated text so far (not a
+ * delta) so the draft-stream consumer can render it directly.
+ */
+export type HarnessEvent =
+  | { type: "thinking"; text: string }
+  | { type: "tool_use"; toolName: string; description?: string }
+  | { type: "text_delta"; text: string };
+
 export interface RunChatOptions {
   prompt: string;
   /** Called with each cleaned incremental text snapshot (full text so far). */
   onText?: (textSoFar: string) => void;
+  /**
+   * Called with normalized turn events (thinking/tool/answer). Claude surfaces
+   * the full set via stream-json partials; other harnesses emit text_delta only
+   * (answer text, no reasoning/tool cards) until their event shapes are mapped.
+   */
+  onEvent?: (event: HarnessEvent) => void;
   /** Resume a prior harness session for conversational continuity. */
   resumeSessionId?: string;
   /** Abort signal to kill the child process. */
@@ -73,6 +89,13 @@ interface HarnessSpec {
   buildArgs(input: BuildArgsInput): { args: string[]; stdin?: string };
   /** Parse raw stdout → final text + session id. Tolerant of partial output. */
   parseOutput(raw: string): ParsedOutput;
+  /**
+   * Optional: build a stateful per-line mapper that turns this harness's NDJSON
+   * events into normalized HarnessEvents. When present, runHarness feeds it each
+   * complete stdout line as it arrives (for true incremental cards). When
+   * absent, runHarness degrades to emitting text_delta from parseOutput.
+   */
+  makeStreamParser?(): (line: Record<string, unknown>, emit: (e: HarnessEvent) => void) => void;
 }
 
 // ── helpers ────────────────────────────────────────────────────────────────
@@ -206,6 +229,43 @@ export function parseClaude(raw: string): ParsedOutput {
   return { text: (result ?? assistantText.join("")).trim(), sessionId };
 }
 
+/**
+ * Stateful mapper for Claude `--include-partial-messages` stream-json. The CLI
+ * wraps raw Anthropic SSE events as `{type:"stream_event", event:{...}}`:
+ *  - content_block_start{content_block.type:"tool_use", name} → tool_use
+ *  - content_block_delta{delta.type:"text_delta", text}       → text_delta
+ *  - content_block_delta{delta.type:"thinking_delta", thinking} → thinking
+ * We accumulate answer/thinking text and emit the FULL running text each time,
+ * matching the draft-stream's update() contract. Message-level `assistant`
+ * events are ignored here (they'd double-count the text); parseClaude still
+ * derives the authoritative final text from them.
+ */
+function makeClaudeStreamParser(): (line: Record<string, unknown>, emit: (e: HarnessEvent) => void) => void {
+  let answer = "";
+  let thinking = "";
+  return (e, emit) => {
+    if (asString(e.type) !== "stream_event") return;
+    const ev = (e.event as Record<string, unknown> | undefined) ?? {};
+    const evType = asString(ev.type);
+    if (evType === "content_block_start") {
+      const cb = (ev.content_block as Record<string, unknown> | undefined) ?? {};
+      if (asString(cb.type) === "tool_use") {
+        emit({ type: "tool_use", toolName: asString(cb.name) ?? "tool" });
+      }
+    } else if (evType === "content_block_delta") {
+      const d = (ev.delta as Record<string, unknown> | undefined) ?? {};
+      const dt = asString(d.type);
+      if (dt === "text_delta") {
+        answer += asString(d.text) ?? "";
+        if (answer) emit({ type: "text_delta", text: answer });
+      } else if (dt === "thinking_delta") {
+        thinking += asString(d.thinking) ?? "";
+        if (thinking) emit({ type: "thinking", text: thinking });
+      }
+    }
+  };
+}
+
 /** Codex `exec --json`: thread.started + item.completed(agent_message) events. */
 export function parseCodex(raw: string): ParsedOutput {
   let sessionId: string | undefined;
@@ -274,13 +334,16 @@ export const HARNESS_REGISTRY: Record<string, HarnessSpec> = {
     homeEnv: (home) => ({ CLAUDE_CONFIG_DIR: home }),
     buildArgs: ({ prompt, model, resumeSessionId }) => {
       // Prompt via stdin (the `-` after --print); NDJSON event stream out.
+      // --include-partial-messages adds token-level stream_event lines so the
+      // card stream can render reasoning/tool/answer incrementally (typewriter).
       const args = ["--print", "-", "--output-format", "stream-json", "--verbose",
-        "--dangerously-skip-permissions"];
+        "--include-partial-messages", "--dangerously-skip-permissions"];
       if (model) args.push("--model", model);
       if (resumeSessionId) args.push("--resume", resumeSessionId);
       return { args, stdin: prompt };
     },
     parseOutput: parseClaude,
+    makeStreamParser: makeClaudeStreamParser,
   },
 
   codex_local: {
@@ -346,6 +409,10 @@ function runHarness(
     let raw = "";
     let stderr = "";
     let settled = false;
+    // Per-line event mapper for harnesses that support rich streaming (Claude).
+    const streamParser =
+      spec.makeStreamParser && opts.onEvent ? spec.makeStreamParser() : null;
+    let lineBuf = "";
     const child = spawn(spec.bin(), args, { env, cwd, stdio: ["pipe", "pipe", "pipe"] });
 
     const finish = (r: RunChatResult) => {
@@ -371,10 +438,30 @@ function runHarness(
     child.stdin?.end();
 
     child.stdout?.on("data", (buf: Buffer) => {
-      raw += buf.toString();
-      if (opts.onText) {
+      const s = buf.toString();
+      raw += s;
+      if (streamParser && opts.onEvent) {
+        // Feed complete lines to the mapper; keep the partial trailing line.
+        lineBuf += s;
+        const parts = lineBuf.split(/\r?\n/);
+        lineBuf = parts.pop() ?? "";
+        for (const line of parts) {
+          const t = line.trim();
+          if (!t) continue;
+          let parsed: Record<string, unknown> | null = null;
+          try {
+            const v = JSON.parse(t);
+            if (v && typeof v === "object") parsed = v as Record<string, unknown>;
+          } catch { /* partial/non-JSON line — skip */ }
+          if (parsed) streamParser(parsed, opts.onEvent);
+        }
+      } else if (opts.onText || opts.onEvent) {
+        // Text-mode fallback: re-derive the full answer and emit it as a snapshot.
         const { text } = spec.parseOutput(raw);
-        if (text) opts.onText(text);
+        if (text) {
+          opts.onText?.(text);
+          opts.onEvent?.({ type: "text_delta", text });
+        }
       }
     });
     child.stderr?.on("data", (buf: Buffer) => { stderr += buf.toString(); });

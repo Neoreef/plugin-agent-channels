@@ -9,11 +9,11 @@ import type { PluginContext } from "@paperclipai/plugin-sdk";
 import { resolveBot } from "./bot-mapping.js";
 import {
   sendCliqMessage,
-  editCliqMessage,
   getChatEditCapability,
   setChatEditCapability,
 } from "../../lib/cliq-client.js";
-import { runAgentChat } from "../../lib/harness.js";
+import { runAgentChat, type HarnessEvent } from "../../lib/harness.js";
+import { createCliqDraftStream } from "../../lib/draft-stream.js";
 import { handleApprovalButton } from "../notifications/approvals.js";
 import type { ActiveQuery } from "../../lib/types.js";
 
@@ -168,55 +168,93 @@ type BackgroundChatArgs = {
   messageText: string;
 };
 
+/** "WriteFile" / "web_search" → "Write File" / "Web Search" for the tool card. */
+function titleCaseTool(name: string): string {
+  return name
+    .split(/(?=[A-Z])|[_\s]+/)
+    .filter(Boolean)
+    .map((w) => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
+    .join(" ");
+}
+
 /**
- * Runs the agent turn and delivers the reply. Detached from the webhook RPC so
- * long turns don't blow the host's 30s webhook budget.
+ * Runs the agent turn and delivers the reply via the card draft stream
+ * (waiting → reasoning → tool → message, edited in place). Detached from the
+ * webhook RPC so long turns don't blow the host's 30s webhook budget.
  *
- * Posts an immediate placeholder, runs the harness, then edits the placeholder
- * in place with the answer. Cliq composite message ids are URL-encoded (%20);
- * extractBotDmMessageRef decodes them so the edit round-trips. If the edit
- * fails, falls back to sending the answer as a new message.
+ * Edit-in-place works for most chats but 400/403s for some users/grants. When a
+ * chat is known non-editable (cached) we skip streaming and send the final
+ * answer once. Otherwise we stream; if the stream learns edits fail mid-turn,
+ * we cache that and deliver the final answer as a plain message.
  */
 async function runChatInBackground(
   ctx: PluginContext,
   args: BackgroundChatArgs,
 ): Promise<void> {
   const { key, chatId, botUniqueName, userId, agentId, companyId, messageText } = args;
-
-  // Edit-in-place works for most chats but 401/403s for some users/grants. We
-  // probe per chat (first edit) + cache; show an editable "Thinking…"
-  // placeholder only when edits may work, and degrade to a plain send otherwise.
-  const editable = chatId ? getChatEditCapability(chatId) : false;
+  const editable = chatId ? getChatEditCapability(chatId) : null;
 
   try {
-    const placeholder = chatId && editable !== false
-      ? await sendCliqMessage(ctx, botUniqueName, userId, "_Thinking…_")
-      : null;
+    // Known non-editable chat: no streaming possible — run to completion and
+    // deliver once as a plain message.
+    if (editable === false) {
+      const result = await runAgentChat(ctx, { agentId, companyId }, {
+        prompt: messageText,
+        timeoutMs: 300_000,
+      });
+      logDone(ctx, agentId, result);
+      await sendCliqMessage(ctx, botUniqueName, userId, finalTextOf(result));
+      return;
+    }
+
+    // Streaming path: a single card edited in place as the turn progresses.
+    const stream = createCliqDraftStream({
+      ctx,
+      botName: botUniqueName,
+      userId,
+      agentName: titleCaseTool(botUniqueName),
+    });
+    await stream.setCardState({ kind: "waiting", title: "Waiting" });
+
+    const onEvent = (ev: HarnessEvent): void => {
+      // Once we're rendering the answer, ignore late reasoning/tool events.
+      if (ev.type === "thinking") {
+        if (stream.getCardState().kind === "message" && stream.hasSent()) return;
+        void stream.setCardState({ kind: "reasoning", title: "Thinking" });
+        if (ev.text) stream.update(ev.text);
+      } else if (ev.type === "tool_use") {
+        if (stream.getCardState().kind === "message" && stream.hasSent()) return;
+        const title = titleCaseTool(ev.toolName);
+        void stream.setCardState({ kind: "tool", title, toolName: title });
+        if (ev.description) stream.update(ev.description);
+      } else if (ev.type === "text_delta") {
+        if (stream.getCardState().kind !== "message") void stream.setCardState({ kind: "message" });
+        if (ev.text) stream.update(ev.text);
+      }
+    };
 
     const result = await runAgentChat(ctx, { agentId, companyId }, {
       prompt: messageText,
       timeoutMs: 300_000,
+      onEvent,
     });
+    logDone(ctx, agentId, result);
 
-    ctx.logger.info(
-      `[done] agent=${agentId} len=${result.text.length} session=${result.sessionId ?? "-"}${result.error ? ` error=${result.error}` : ""} final="${result.text.slice(0, 200).replace(/\n/g, "\\n")}"`,
-    );
+    // Finalize: render the authoritative final text and stop the stream.
+    const finalText = finalTextOf(result);
+    await stream.setCardState({ kind: "message" });
+    stream.update(finalText);
+    await stream.stop();
 
-    const finalText = result.text
-      || (result.error ? `Sorry — ${result.error}` : "_(No response from agent.)_");
-
-    // Edit the placeholder in place when possible; learn + cache capability.
-    let delivered = false;
-    const ref = placeholder?.ref;
-    if (ref?.chatId && ref?.messageId) {
-      const edit = await editCliqMessage(ctx, ref.chatId, ref.messageId, finalText);
-      const ok = edit.status >= 200 && edit.status < 300;
-      setChatEditCapability(ref.chatId, ok);
-      delivered = ok;
-      if (!ok) ctx.logger.info(`Cliq edit not supported for chat (${edit.status}); sending plain`);
-    }
-    if (!delivered) {
+    // Learn + cache edit capability; if edits failed mid-stream, the streamed
+    // card is stale — deliver the final answer as a plain message.
+    const cid = stream.messageRef()?.chatId ?? chatId;
+    if (stream.editsDisabled()) {
+      if (cid) setChatEditCapability(cid, false);
+      ctx.logger.info(`Cliq edit not supported for chat; sent plain fallback`);
       await sendCliqMessage(ctx, botUniqueName, userId, finalText);
+    } else if (cid) {
+      setChatEditCapability(cid, true);
     }
   } catch (err) {
     ctx.logger.error(`Agent invoke failed: ${String(err)}`);
@@ -229,4 +267,14 @@ async function runChatInBackground(
   } finally {
     activeQueries.delete(key);
   }
+}
+
+function finalTextOf(result: { text: string; error?: string }): string {
+  return result.text || (result.error ? `Sorry — ${result.error}` : "_(No response from agent.)_");
+}
+
+function logDone(ctx: PluginContext, agentId: string, result: { text: string; sessionId?: string; error?: string }): void {
+  ctx.logger.info(
+    `[done] agent=${agentId} len=${result.text.length} session=${result.sessionId ?? "-"}${result.error ? ` error=${result.error}` : ""} final="${result.text.slice(0, 200).replace(/\n/g, "\\n")}"`,
+  );
 }

@@ -42,6 +42,8 @@ export type CliqDraftStream = {
   hasSent: () => boolean;
   getCardState: () => CardState;
   setCardState: (state: CardState) => Promise<void>;
+  /** True once an edit returned 400/403 and the stream stopped editing. */
+  editsDisabled: () => boolean;
 };
 
 const CHUNK_LIMIT = 3500;
@@ -419,6 +421,7 @@ export function createCliqDraftStream(params: DraftStreamParams): CliqDraftStrea
     hasSent: () => didSend,
     getCardState: () => currentState,
     setCardState,
+    editsDisabled: () => editDisabled,
   };
 }
 
