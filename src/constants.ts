@@ -30,13 +30,24 @@ export const DATA_CENTERS = {
 
 export type DataCenterKey = keyof typeof DATA_CENTERS;
 
-/** OAuth scopes for Cliq messaging */
+/**
+ * OAuth scopes for Cliq messaging — mirrors the proven Claude Agent grant.
+ * Messages.CREATE/UPDATE are required to send + edit-in-place (the edit 401'd
+ * without Messages.UPDATE); messageactions.* back the card buttons.
+ */
 export const CLIQ_SCOPES = [
+  "ZohoCliq.Messages.CREATE",
+  "ZohoCliq.Messages.READ",
+  "ZohoCliq.Messages.UPDATE",
+  "ZohoCliq.Messages.DELETE",
   "ZohoCliq.Webhooks.CREATE",
   "ZohoCliq.Webhooks.UPDATE",
-  "ZohoCliq.Messages.READ",
-  "ZohoCliq.Messages.DELETE",
-  "ZohoCliq.Chats.READ",
   "ZohoCliq.Bots.READ",
+  "ZohoCliq.messageactions.READ",
+  "ZohoCliq.messageactions.CREATE",
+  "ZohoCliq.messageactions.DELETE",
+  "ZohoCliq.Channels.READ",
+  "ZohoCliq.Chats.READ",
   "ZohoCliq.Attachments.READ",
+  "ZohoCliq.StorageData.ALL",
 ].join(",");

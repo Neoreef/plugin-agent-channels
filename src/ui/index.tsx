@@ -63,7 +63,7 @@ const AVAILABLE_CHANNELS: ServiceDef[] = [
     type: "zoho-cliq", name: "Zoho Cliq",
     description: "Agent chat through Zoho Cliq bots",
     status: "available", authType: "oauth", provider: "zoho",
-    scopes: "ZohoCliq.Webhooks.CREATE,ZohoCliq.Webhooks.UPDATE,ZohoCliq.Messages.READ,ZohoCliq.Messages.DELETE,ZohoCliq.Chats.READ,ZohoCliq.Bots.READ,ZohoCliq.Attachments.READ",
+    scopes: "ZohoCliq.Messages.CREATE,ZohoCliq.Messages.READ,ZohoCliq.Messages.UPDATE,ZohoCliq.Messages.DELETE,ZohoCliq.Webhooks.CREATE,ZohoCliq.Webhooks.UPDATE,ZohoCliq.Bots.READ,ZohoCliq.messageactions.READ,ZohoCliq.messageactions.CREATE,ZohoCliq.messageactions.DELETE,ZohoCliq.Channels.READ,ZohoCliq.Chats.READ,ZohoCliq.Attachments.READ,ZohoCliq.StorageData.ALL",
   },
   { type: "microsoft-teams", name: "Microsoft Teams", description: "Bot conversations in Teams", status: "coming-soon", authType: "oauth", provider: "microsoft" },
   { type: "discord", name: "Discord", description: "Bot commands in Discord servers", status: "coming-soon", authType: "oauth", provider: "discord" },
