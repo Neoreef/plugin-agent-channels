@@ -238,6 +238,25 @@ export type CliqMessageRef = {
   messageId?: string;
 };
 
+// ─── Edit-capability probe cache (per chat, 24h) ─────────────────────────────
+// Some users/grants can't edit bot messages (edit → 401/403). We learn this
+// per chat from the first edit attempt and degrade to plain sends thereafter,
+// rather than leaving a placeholder stuck. (Pattern from ~/.claude-agent.)
+
+const editCapabilityCache = new Map<string, { capable: boolean; at: number }>();
+const EDIT_CAP_TTL_MS = 24 * 60 * 60 * 1000;
+
+export function getChatEditCapability(chatId: string): boolean | undefined {
+  const c = editCapabilityCache.get(chatId);
+  if (!c) return undefined;
+  if (Date.now() - c.at > EDIT_CAP_TTL_MS) { editCapabilityCache.delete(chatId); return undefined; }
+  return c.capable;
+}
+
+export function setChatEditCapability(chatId: string, capable: boolean): void {
+  editCapabilityCache.set(chatId, { capable, at: Date.now() });
+}
+
 // ─── Message Ref Extraction ──────────────────────────────────────────────────
 
 /**

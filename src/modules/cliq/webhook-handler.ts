@@ -7,7 +7,12 @@
 
 import type { PluginContext } from "@paperclipai/plugin-sdk";
 import { resolveBot } from "./bot-mapping.js";
-import { sendCliqMessage } from "../../lib/cliq-client.js";
+import {
+  sendCliqMessage,
+  editCliqMessage,
+  getChatEditCapability,
+  setChatEditCapability,
+} from "../../lib/cliq-client.js";
 import { runAgentChat } from "../../lib/harness.js";
 import { handleApprovalButton } from "../notifications/approvals.js";
 import type { ActiveQuery } from "../../lib/types.js";
@@ -132,8 +137,18 @@ export async function handleCliqWebhook(
   // in place with the answer. Cliq composite message ids are URL-encoded
   // (%20); extractBotDmMessageRef decodes them so the edit round-trips. If the
   // edit still fails, fall back to sending the answer as a new message.
+  const chatId = (payload.chat as { id?: string } | undefined)?.id;
+  // Edit-in-place works for most chats but 401/403s for some users/grants. We
+  // probe per chat (first edit) + cache; show an editable "Thinking…"
+  // placeholder only when edits may work, and degrade to a plain send otherwise.
+  const editable = chatId ? getChatEditCapability(chatId) : false;
+
   try {
     activeQueries.set(key, { userId, agentId, sessionId: "", startedAt: Date.now() });
+
+    const placeholder = chatId && editable !== false
+      ? await sendCliqMessage(ctx, botUniqueName, userId, "_Thinking…_")
+      : null;
 
     const result = await runAgentChat(ctx, { agentId, companyId }, {
       prompt: messageText,
@@ -144,13 +159,22 @@ export async function handleCliqWebhook(
       `[done] agent=${agentId} len=${result.text.length} session=${result.sessionId ?? "-"}${result.error ? ` error=${result.error}` : ""} final="${result.text.slice(0, 200).replace(/\n/g, "\\n")}"`,
     );
 
-    // Deliver as a single bot message. Edit-in-place is unavailable: the edit
-    // endpoint returns 401 for bot messages even with Webhooks.UPDATE scope and
-    // the message_id %20 fix (see cliq-client decodeId). Plain delivery is the
-    // reliable path; the Deluge handler's "Processing…" covers the wait.
     const finalText = result.text
       || (result.error ? `Sorry — ${result.error}` : "_(No response from agent.)_");
-    await sendCliqMessage(ctx, botUniqueName, userId, finalText);
+
+    // Edit the placeholder in place when possible; learn + cache capability.
+    let delivered = false;
+    const ref = placeholder?.ref;
+    if (ref?.chatId && ref?.messageId) {
+      const edit = await editCliqMessage(ctx, ref.chatId, ref.messageId, finalText);
+      const ok = edit.status >= 200 && edit.status < 300;
+      setChatEditCapability(ref.chatId, ok);
+      delivered = ok;
+      if (!ok) ctx.logger.info(`Cliq edit not supported for chat (${edit.status}); sending plain`);
+    }
+    if (!delivered) {
+      await sendCliqMessage(ctx, botUniqueName, userId, finalText);
+    }
   } catch (err) {
     ctx.logger.error(`Agent invoke failed: ${String(err)}`);
     await sendCliqMessage(
