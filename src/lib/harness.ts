@@ -230,9 +230,40 @@ export function parseClaude(raw: string): ParsedOutput {
 }
 
 /**
+ * Render a tool call's input into a short, human-readable line for the tool
+ * card — the salient argument per tool (path, command, pattern, url), falling
+ * back to a truncated JSON blob. Mirrors claude-agent's tool slide.
+ */
+function summarizeToolInput(toolName: string, input: Record<string, unknown>): string | undefined {
+  const s = (k: string): string | undefined => asString(input[k]);
+  const n = toolName.toLowerCase();
+  const path = s("file_path") ?? s("path") ?? s("notebook_path");
+  if (path) return path;
+  if (n.includes("bash") || n.includes("exec") || n.includes("shell")) return s("command");
+  if (n.includes("glob") || n.includes("grep") || n.includes("search")) {
+    return [s("pattern"), s("path") ? `in ${s("path")}` : undefined].filter(Boolean).join(" ");
+  }
+  if (n.includes("fetch") || n.includes("web")) return s("url") ?? s("query") ?? s("prompt");
+  if (n.includes("task") || n.includes("agent")) return s("description") ?? s("prompt");
+  // Generic: first non-empty string value, else a compact JSON snippet.
+  for (const v of Object.values(input)) {
+    const t = asString(v);
+    if (t) return t;
+  }
+  try {
+    const j = JSON.stringify(input);
+    return j && j !== "{}" ? j : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * Stateful mapper for Claude `--include-partial-messages` stream-json. The CLI
  * wraps raw Anthropic SSE events as `{type:"stream_event", event:{...}}`:
- *  - content_block_start{content_block.type:"tool_use", name} → tool_use
+ *  - content_block_start{content_block.type:"tool_use", name} → tool_use (name)
+ *  - content_block_delta{delta.type:"input_json_delta", partial_json} accumulates
+ *    the tool input; on content_block_stop we re-emit tool_use with a description
  *  - content_block_delta{delta.type:"text_delta", text}       → text_delta
  *  - content_block_delta{delta.type:"thinking_delta", thinking} → thinking
  * We accumulate answer/thinking text and emit the FULL running text each time,
@@ -243,14 +274,30 @@ export function parseClaude(raw: string): ParsedOutput {
 function makeClaudeStreamParser(): (line: Record<string, unknown>, emit: (e: HarnessEvent) => void) => void {
   let answer = "";
   let thinking = "";
+  // Per-block-index tool state: name + accumulating input_json_delta buffer.
+  const tools = new Map<number, { name: string; json: string }>();
   return (e, emit) => {
     if (asString(e.type) !== "stream_event") return;
     const ev = (e.event as Record<string, unknown> | undefined) ?? {};
     const evType = asString(ev.type);
+    const index = typeof ev.index === "number" ? ev.index : -1;
     if (evType === "content_block_start") {
       const cb = (ev.content_block as Record<string, unknown> | undefined) ?? {};
       if (asString(cb.type) === "tool_use") {
-        emit({ type: "tool_use", toolName: asString(cb.name) ?? "tool" });
+        const name = asString(cb.name) ?? "tool";
+        tools.set(index, { name, json: "" });
+        emit({ type: "tool_use", toolName: name });
+      }
+    } else if (evType === "content_block_stop") {
+      const tool = tools.get(index);
+      if (tool) {
+        tools.delete(index);
+        let description: string | undefined;
+        try {
+          const parsed = tool.json ? (JSON.parse(tool.json) as Record<string, unknown>) : {};
+          description = summarizeToolInput(tool.name, parsed);
+        } catch { /* incomplete JSON — skip description */ }
+        emit({ type: "tool_use", toolName: tool.name, description });
       }
     } else if (evType === "content_block_delta") {
       const d = (ev.delta as Record<string, unknown> | undefined) ?? {};
@@ -261,6 +308,9 @@ function makeClaudeStreamParser(): (line: Record<string, unknown>, emit: (e: Har
       } else if (dt === "thinking_delta") {
         thinking += asString(d.thinking) ?? "";
         if (thinking) emit({ type: "thinking", text: thinking });
+      } else if (dt === "input_json_delta") {
+        const tool = tools.get(index);
+        if (tool) tool.json += asString(d.partial_json) ?? "";
       }
     }
   };
