@@ -15,6 +15,7 @@ import {
 import { runAgentChat, type HarnessEvent } from "../../lib/harness.js";
 import { createCliqDraftStream } from "../../lib/draft-stream.js";
 import { getResumeSession, saveSession } from "./session-store.js";
+import { honchoEnabled, resolveHonchoScope, recordHonchoTurn } from "../../lib/honcho.js";
 import { handleApprovalButton } from "../notifications/approvals.js";
 import type { ActiveQuery } from "../../lib/types.js";
 
@@ -198,6 +199,15 @@ async function runChatInBackground(
   // Resume this user's prior session with this agent for multi-turn memory.
   const resumeSessionId = await getResumeSession(ctx, userId, agentId);
 
+  // Honcho memory scope (workspace/user/agent peers) — resolved once, used for
+  // plugin-write (and passed to the harness for the optional MCP tools path).
+  const honchoScope = honchoEnabled()
+    ? await resolveHonchoScope(ctx, { companyId, agentId, channelUserId: userId }).catch((e) => {
+        ctx.logger.info(`Honcho scope resolve failed: ${String(e)}`);
+        return null;
+      })
+    : null;
+
   try {
     // Known non-editable chat: no streaming possible — run to completion and
     // deliver once as a plain message.
@@ -207,10 +217,12 @@ async function runChatInBackground(
         timeoutMs: 300_000,
         resumeSessionId,
         channelUserId: userId,
+        honcho: honchoScope ?? undefined,
       });
       logDone(ctx, agentId, result);
       await saveSession(ctx, userId, agentId, result.sessionId);
       await sendCliqMessage(ctx, botUniqueName, userId, finalTextOf(result));
+      if (honchoScope) await recordHonchoTurn(ctx, honchoScope, messageText, result.text);
       return;
     }
 
@@ -246,6 +258,7 @@ async function runChatInBackground(
       onEvent,
       resumeSessionId,
       channelUserId: userId,
+      honcho: honchoScope ?? undefined,
     });
     logDone(ctx, agentId, result);
     await saveSession(ctx, userId, agentId, result.sessionId);
@@ -266,6 +279,9 @@ async function runChatInBackground(
     } else if (cid) {
       setChatEditCapability(cid, true);
     }
+
+    // Plugin-write: record the turn to Honcho off the agent loop (after delivery).
+    if (honchoScope) await recordHonchoTurn(ctx, honchoScope, messageText, result.text);
   } catch (err) {
     ctx.logger.error(`Agent invoke failed: ${String(err)}`);
     await sendCliqMessage(

@@ -36,6 +36,17 @@ export function honchoEnabled(): boolean {
   return existsSync(HONCHO_FLAG_FILE);
 }
 
+/** Separate gate for the per-turn agent-MCP TOOLS path (the slow stdio write
+ *  path; superseded by plugin-write #38 + recall-only #40 + hot http #42).
+ *  Default OFF so the master flag enables plugin-write WITHOUT the agent-MCP. */
+const HONCHO_MCP_TOOLS_FLAG = path.join(
+  env("PAPERCLIP_HOME") ?? path.join(os.homedir(), ".paperclip"),
+  "honcho-mcp-tools.enabled",
+);
+export function honchoMcpToolsEnabled(): boolean {
+  return existsSync(HONCHO_MCP_TOOLS_FLAG);
+}
+
 function honchoBaseUrl(): string { return env("HONCHO_API_URL") ?? "http://127.0.0.1:18820"; }
 function honchoMcpRunner(): string { return env("HONCHO_MCP_RUNNER") ?? "/home/brian/projects/honcho/mcp/runner.ts"; }
 function honchoMcpTsx(): string {
@@ -64,8 +75,16 @@ export async function resolveHonchoScope(
     companyName = (await ctx.companies.get(params.companyId))?.name ?? null;
   } catch { /* fall back to prefix_companyId */ }
 
+  // Agent display name drives peerIdForAgent; fetch it if the caller didn't supply it.
+  let agentName = params.agentName ?? null;
+  if (!agentName) {
+    try {
+      agentName = (await ctx.agents.get(params.agentId, params.companyId) as { name?: string } | null)?.name ?? null;
+    } catch { /* peerIdForAgent falls back to agent_<id> */ }
+  }
+
   const workspaceId = workspaceIdForCompany(params.companyId, DEFAULT_WORKSPACE_PREFIX, companyName);
-  const agentPeer = peerIdForAgent(params.agentId, params.agentName ?? null);
+  const agentPeer = peerIdForAgent(params.agentId, agentName);
 
   const paperclipUserId = await resolvePaperclipUserFromCliq(ctx, params.channelUserId).catch(() => null);
   const userPeer = paperclipUserId ? peerIdForUser(paperclipUserId) : params.channelUserId;
@@ -74,6 +93,48 @@ export async function resolveHonchoScope(
   const sessionId = `cliq_${hashId(`${userPeer}|${agentPeer}`).slice(0, 16)}`;
 
   return { workspaceId, userPeer, agentPeer, sessionId, baseUrl: honchoBaseUrl() };
+}
+
+/**
+ * Plugin-side write: record one chat turn to Honcho directly via the v3 API,
+ * off the agent loop. Two calls: get-or-create the session with its peers (+
+ * observe config), then append the user + assistant messages. Best-effort —
+ * the reply is already delivered, so failures are logged, never thrown.
+ */
+export async function recordHonchoTurn(
+  ctx: PluginContext,
+  scope: HonchoScope,
+  userMessage: string,
+  agentReply: string,
+): Promise<void> {
+  if (!userMessage.trim() || !agentReply.trim()) return;
+  const base = `${scope.baseUrl}/v3/workspaces/${encodeURIComponent(scope.workspaceId)}`;
+  const postJson = (url: string, body: unknown): Promise<unknown> =>
+    ctx.http.fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+  try {
+    // 1. get-or-create session + peers (idempotent; auto-creates the peers).
+    await postJson(`${base}/sessions`, {
+      id: scope.sessionId,
+      peers: {
+        [scope.userPeer]: { observe_me: true, observe_others: true },
+        [scope.agentPeer]: { observe_me: false, observe_others: true },
+      },
+    });
+    // 2. record the turn.
+    await postJson(`${base}/sessions/${encodeURIComponent(scope.sessionId)}/messages`, {
+      messages: [
+        { peer_id: scope.userPeer, content: userMessage },
+        { peer_id: scope.agentPeer, content: agentReply },
+      ],
+    });
+    ctx.logger.info(`Honcho: recorded turn → ${scope.workspaceId}/${scope.sessionId} (${scope.userPeer} ↔ ${scope.agentPeer})`);
+  } catch (e) {
+    ctx.logger.info(`Honcho plugin-write failed (non-fatal): ${String(e)}`);
+  }
 }
 
 /** The `mcpServers` object that points a harness at the scoped Honcho MCP. */

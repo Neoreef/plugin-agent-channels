@@ -22,8 +22,7 @@ import os from "node:os";
 import path from "node:path";
 import type { PluginContext } from "@paperclipai/plugin-sdk";
 import {
-  honchoEnabled,
-  resolveHonchoScope,
+  honchoMcpToolsEnabled,
   writeHonchoMcpConfig,
   honchoInstructions,
   type HonchoScope,
@@ -737,9 +736,9 @@ function runHarness(
   const home = spec.resolveHome(cfg.adapterConfig, cfg.companyId);
   // Inject persona only on a fresh turn; a resumed session already has it.
   const persona = opts.resumeSessionId ? "" : readPersona(cfg.adapterConfig);
-  // Honcho memory: only for MCP-capable harnesses with a resolved scope. Write a
-  // per-turn MCP config and inject the usage instructions every turn.
-  const useHoncho = !!(opts.honcho && spec.mcp);
+  // Honcho agent-MCP TOOLS path: only for MCP-capable harnesses, with a scope,
+  // and explicitly enabled (default off — plugin-write handles memory).
+  const useHoncho = !!(opts.honcho && spec.mcp && honchoMcpToolsEnabled());
   const mcpConfigPath = useHoncho ? writeHonchoMcpConfig(opts.honcho!) : undefined;
   const extra = useHoncho ? honchoInstructions(opts.honcho!) : undefined;
   const { args, stdin } = spec.buildArgs({
@@ -858,24 +857,8 @@ export async function runAgentChat(
     agentId: params.agentId, companyId: params.companyId, adapterType, adapterConfig,
   };
 
-  // Resolve per-user Honcho scope for MCP-capable harnesses (opt-in).
-  if (spec.mcp && honchoEnabled() && opts.channelUserId && !opts.honcho) {
-    try {
-      const agentName = (agent as { name?: string }).name ?? null;
-      opts = {
-        ...opts,
-        honcho: await resolveHonchoScope(ctx, {
-          companyId: params.companyId,
-          agentId: params.agentId,
-          agentName,
-          channelUserId: opts.channelUserId,
-        }),
-      };
-    } catch (e) {
-      ctx.logger.info(`Honcho scope resolve failed (continuing without memory): ${String(e)}`);
-    }
-  }
-
+  // Honcho scope (opts.honcho) is resolved by the caller (webhook) and used for
+  // plugin-write; the per-turn agent-MCP TOOLS path below is opt-in + separate.
   if (spec.runner) return spec.runner(invokeCfg, opts);
   return runHarness(spec, invokeCfg, opts);
 }
