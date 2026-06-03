@@ -116,6 +116,13 @@ interface HarnessSpec {
   runner?(cfg: AgentInvokeConfig, opts: RunChatOptions): Promise<RunChatResult>;
   /** This harness can load an MCP server via --mcp-config (enables Honcho memory). */
   mcp?: boolean;
+  /**
+   * Optional: CLI args that set the system prompt (e.g. claude
+   * --append-system-prompt). When present, persona + memory instructions go to
+   * the system channel and the user message stays clean; when absent, runHarness
+   * folds them into the prompt instead.
+   */
+  systemArgs?(system: string): string[];
 }
 
 // ── helpers ────────────────────────────────────────────────────────────────
@@ -469,6 +476,7 @@ export const HARNESS_REGISTRY: Record<string, HarnessSpec> = {
     parseOutput: parseClaude,
     makeStreamParser: makeClaudeStreamParser,
     mcp: true,
+    systemArgs: (system) => ["--append-system-prompt", system],
   },
 
   codex_local: {
@@ -741,13 +749,20 @@ function runHarness(
   const useHoncho = !!(opts.honcho && spec.mcp && honchoMcpToolsEnabled());
   const mcpConfigPath = useHoncho ? writeHonchoMcpConfig(opts.honcho!) : undefined;
   const extra = useHoncho ? honchoInstructions(opts.honcho!) : undefined;
+
+  // System content (persona + memory instructions) goes to the harness's system
+  // channel when it has one (claude --append-system-prompt), keeping the user
+  // message clean; otherwise it's folded into the prompt.
+  const systemText = [persona, extra].filter((s) => s && s.trim()).join("\n\n");
+  const useSystemArgs = !!(systemText && spec.systemArgs);
   const { args, stdin } = spec.buildArgs({
-    prompt: composePrompt(persona, opts.prompt, extra),
+    prompt: useSystemArgs ? opts.prompt : composePrompt(systemText, opts.prompt),
     model: asString(cfg.adapterConfig.model),
     provider: asString(cfg.adapterConfig.provider),
     resumeSessionId: opts.resumeSessionId,
     mcpConfigPath,
   });
+  if (useSystemArgs) args.push(...spec.systemArgs!(systemText));
 
   // The sandboxed worker is forked without HOME, but CLI launchers resolve
   // their versioned binary under $HOME (e.g. ~/.local/share/claude/versions).
