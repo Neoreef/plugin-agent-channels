@@ -21,6 +21,13 @@ import { readdirSync, readFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { PluginContext } from "@paperclipai/plugin-sdk";
+import {
+  honchoEnabled,
+  resolveHonchoScope,
+  writeHonchoMcpConfig,
+  honchoInstructions,
+  type HonchoScope,
+} from "./honcho.js";
 
 export interface AgentInvokeConfig {
   agentId: string;
@@ -52,6 +59,10 @@ export interface RunChatOptions {
   onEvent?: (event: HarnessEvent) => void;
   /** Resume a prior harness session for conversational continuity. */
   resumeSessionId?: string;
+  /** Platform (e.g. Cliq) user id — used to scope per-user Honcho memory. */
+  channelUserId?: string;
+  /** Resolved Honcho scope for this turn (set internally by runAgentChat). */
+  honcho?: HonchoScope;
   /** Abort signal to kill the child process. */
   signal?: AbortSignal;
   /** Hard cap on runtime (ms). Default 300_000. */
@@ -76,6 +87,8 @@ interface BuildArgsInput {
   model?: string;
   provider?: string;
   resumeSessionId?: string;
+  /** Path to a per-turn MCP config JSON (Honcho), when the harness supports MCP. */
+  mcpConfigPath?: string;
 }
 
 interface HarnessSpec {
@@ -102,6 +115,8 @@ interface HarnessSpec {
    * one-shot). When present, runAgentChat calls this instead of runHarness.
    */
   runner?(cfg: AgentInvokeConfig, opts: RunChatOptions): Promise<RunChatResult>;
+  /** This harness can load an MCP server via --mcp-config (enables Honcho memory). */
+  mcp?: boolean;
 }
 
 // ── helpers ────────────────────────────────────────────────────────────────
@@ -162,14 +177,15 @@ export function readPersona(adapterConfig: Record<string, unknown>): string {
   return parts.join("\n\n").trim();
 }
 
-/** Frame persona + the user's message into a single turn for headless CLIs. */
-function composePrompt(persona: string, userPrompt: string): string {
-  if (!persona) return userPrompt;
+/** Frame persona (+ optional extra system instructions) + the user's message. */
+function composePrompt(persona: string, userPrompt: string, extra?: string): string {
+  const system = [persona, extra].filter((s) => s && s.trim()).join("\n\n");
+  if (!system) return userPrompt;
   return [
     "You are operating under the following agent instructions. Stay in character and follow them for this conversation.",
     "",
     "<agent_instructions>",
-    persona,
+    system,
     "</agent_instructions>",
     "",
     "Respond to this message:",
@@ -439,18 +455,21 @@ export const HARNESS_REGISTRY: Record<string, HarnessSpec> = {
     bin: () => binFor("CLAUDE_BIN", "claude"),
     resolveHome: (cfg) => envHome(cfg, "CLAUDE_CONFIG_DIR") ?? path.resolve(os.homedir(), ".claude"),
     homeEnv: (home) => ({ CLAUDE_CONFIG_DIR: home }),
-    buildArgs: ({ prompt, model, resumeSessionId }) => {
+    buildArgs: ({ prompt, model, resumeSessionId, mcpConfigPath }) => {
       // Prompt via stdin (the `-` after --print); NDJSON event stream out.
       // --include-partial-messages adds token-level stream_event lines so the
       // card stream can render reasoning/tool/answer incrementally (typewriter).
       const args = ["--print", "-", "--output-format", "stream-json", "--verbose",
         "--include-partial-messages", "--dangerously-skip-permissions"];
+      // Honcho memory MCP (scoped per turn); strict = ignore the user's global MCPs.
+      if (mcpConfigPath) args.push("--mcp-config", mcpConfigPath, "--strict-mcp-config");
       if (model) args.push("--model", model);
       if (resumeSessionId) args.push("--resume", resumeSessionId);
       return { args, stdin: prompt };
     },
     parseOutput: parseClaude,
     makeStreamParser: makeClaudeStreamParser,
+    mcp: true,
   },
 
   codex_local: {
@@ -718,11 +737,17 @@ function runHarness(
   const home = spec.resolveHome(cfg.adapterConfig, cfg.companyId);
   // Inject persona only on a fresh turn; a resumed session already has it.
   const persona = opts.resumeSessionId ? "" : readPersona(cfg.adapterConfig);
+  // Honcho memory: only for MCP-capable harnesses with a resolved scope. Write a
+  // per-turn MCP config and inject the usage instructions every turn.
+  const useHoncho = !!(opts.honcho && spec.mcp);
+  const mcpConfigPath = useHoncho ? writeHonchoMcpConfig(opts.honcho!) : undefined;
+  const extra = useHoncho ? honchoInstructions(opts.honcho!) : undefined;
   const { args, stdin } = spec.buildArgs({
-    prompt: composePrompt(persona, opts.prompt),
+    prompt: composePrompt(persona, opts.prompt, extra),
     model: asString(cfg.adapterConfig.model),
     provider: asString(cfg.adapterConfig.provider),
     resumeSessionId: opts.resumeSessionId,
+    mcpConfigPath,
   });
 
   // The sandboxed worker is forked without HOME, but CLI launchers resolve
@@ -832,6 +857,25 @@ export async function runAgentChat(
   const invokeCfg: AgentInvokeConfig = {
     agentId: params.agentId, companyId: params.companyId, adapterType, adapterConfig,
   };
+
+  // Resolve per-user Honcho scope for MCP-capable harnesses (opt-in).
+  if (spec.mcp && honchoEnabled() && opts.channelUserId && !opts.honcho) {
+    try {
+      const agentName = (agent as { name?: string }).name ?? null;
+      opts = {
+        ...opts,
+        honcho: await resolveHonchoScope(ctx, {
+          companyId: params.companyId,
+          agentId: params.agentId,
+          agentName,
+          channelUserId: opts.channelUserId,
+        }),
+      };
+    } catch (e) {
+      ctx.logger.info(`Honcho scope resolve failed (continuing without memory): ${String(e)}`);
+    }
+  }
+
   if (spec.runner) return spec.runner(invokeCfg, opts);
   return runHarness(spec, invokeCfg, opts);
 }

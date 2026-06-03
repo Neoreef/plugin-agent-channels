@@ -206,6 +206,7 @@ async function runChatInBackground(
         prompt: messageText,
         timeoutMs: 300_000,
         resumeSessionId,
+        channelUserId: userId,
       });
       logDone(ctx, agentId, result);
       await saveSession(ctx, userId, agentId, result.sessionId);
@@ -244,6 +245,7 @@ async function runChatInBackground(
       timeoutMs: 300_000,
       onEvent,
       resumeSessionId,
+      channelUserId: userId,
     });
     logDone(ctx, agentId, result);
     await saveSession(ctx, userId, agentId, result.sessionId);
