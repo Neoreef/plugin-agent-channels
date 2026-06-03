@@ -62,6 +62,8 @@ export interface RunChatOptions {
   channelUserId?: string;
   /** Resolved Honcho scope for this turn (set internally by runAgentChat). */
   honcho?: HonchoScope;
+  /** Honcho recall snippet to inject at the system level (plugin-recall). */
+  memoryContext?: string;
   /** Abort signal to kill the child process. */
   signal?: AbortSignal;
   /** Hard cap on runtime (ms). Default 300_000. */
@@ -559,8 +561,9 @@ function runHermesAcp(cfg: AgentInvokeConfig, opts: RunChatOptions): Promise<Run
   const home = envHome(cfg.adapterConfig, "HOME", "HERMES_HOME")
     ?? managedCompanyHome(cfg.companyId, "hermes-home");
   // Inject persona only on a fresh turn; a resumed ACP session already has it.
+  // hermes has no per-turn system flag, so memory recall folds into the prompt.
   const persona = opts.resumeSessionId ? "" : readPersona(cfg.adapterConfig);
-  const promptText = composePrompt(persona, opts.prompt);
+  const promptText = composePrompt(persona, opts.prompt, opts.memoryContext);
   const bin = binFor("HERMES_BIN", path.join(os.homedir(), ".local", "bin", "hermes"));
   const env: Record<string, string> = {
     ...(process.env as Record<string, string>),
@@ -753,7 +756,7 @@ function runHarness(
   // System content (persona + memory instructions) goes to the harness's system
   // channel when it has one (claude --append-system-prompt), keeping the user
   // message clean; otherwise it's folded into the prompt.
-  const systemText = [persona, extra].filter((s) => s && s.trim()).join("\n\n");
+  const systemText = [persona, opts.memoryContext, extra].filter((s) => s && s.trim()).join("\n\n");
   const useSystemArgs = !!(systemText && spec.systemArgs);
   const { args, stdin } = spec.buildArgs({
     prompt: useSystemArgs ? opts.prompt : composePrompt(systemText, opts.prompt),

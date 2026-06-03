@@ -137,6 +137,58 @@ export async function recordHonchoTurn(
   }
 }
 
+// Short in-memory cache of the recall snippet per (workspace, user peer).
+const recallCache = new Map<string, { snippet: string; at: number }>();
+const RECALL_TTL_MS = 120_000;
+
+function formatRecall(userPeer: string, data: { representation?: unknown; peer_card?: unknown }): string | null {
+  const parts: string[] = [];
+  const rep = data.representation;
+  if (typeof rep === "string" && rep.trim()) {
+    const lines = rep.split("\n").filter((l) => l.trim() && !l.startsWith("#")).slice(0, 5)
+      .map((l) => l.replace(/^\[.*?\]\s*/, "").replace(/^-\s*/, "").trim());
+    const summary = lines.filter(Boolean).join("; ");
+    if (summary) parts.push(`Relevant conclusions: ${summary}`);
+  }
+  const card = data.peer_card;
+  if (Array.isArray(card) && card.length) parts.push(`Profile: ${card.join("; ")}`);
+  if (!parts.length) return null;
+  return `[Honcho memory for this user]: ${parts.join(" | ")}`;
+}
+
+/**
+ * Plugin-side recall: fetch the user peer's representation (conclusions +
+ * profile) from Honcho and return a compact snippet to inject at the SYSTEM
+ * level. Off the agent loop, timeboxed + cached, silent on failure. Empty until
+ * Honcho's deriver has processed enough turns into conclusions.
+ */
+export async function honchoRecall(
+  ctx: PluginContext,
+  scope: HonchoScope,
+  prompt: string,
+): Promise<string | null> {
+  const cacheKey = `${scope.workspaceId}:${scope.userPeer}`;
+  const cached = recallCache.get(cacheKey);
+  if (cached && Date.now() - cached.at < RECALL_TTL_MS) return cached.snippet || null;
+  try {
+    const qs = new URLSearchParams({ include_most_frequent: "true", max_conclusions: "15" });
+    if (prompt.trim()) { qs.set("search_query", prompt.slice(0, 200)); qs.set("search_top_k", "5"); }
+    const url = `${scope.baseUrl}/v3/workspaces/${encodeURIComponent(scope.workspaceId)}/peers/${encodeURIComponent(scope.userPeer)}/context?${qs.toString()}`;
+    const res = (await Promise.race([
+      ctx.http.fetch(url, { method: "GET" }),
+      new Promise<null>((r) => setTimeout(() => r(null), 3000)),
+    ])) as { text?: () => Promise<string> } | null;
+    if (!res || typeof res.text !== "function") return cached?.snippet || null;
+    const data = JSON.parse(await res.text()) as { representation?: unknown; peer_card?: unknown };
+    const snippet = formatRecall(scope.userPeer, data);
+    recallCache.set(cacheKey, { snippet: snippet ?? "", at: Date.now() });
+    return snippet;
+  } catch (e) {
+    ctx.logger.info(`Honcho recall failed (non-fatal): ${String(e)}`);
+    return cached?.snippet || null;
+  }
+}
+
 /** The `mcpServers` object that points a harness at the scoped Honcho MCP. */
 export function honchoMcpServers(scope: HonchoScope): Record<string, unknown> {
   return {

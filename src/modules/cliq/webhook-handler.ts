@@ -15,7 +15,7 @@ import {
 import { runAgentChat, type HarnessEvent } from "../../lib/harness.js";
 import { createCliqDraftStream } from "../../lib/draft-stream.js";
 import { getResumeSession, saveSession } from "./session-store.js";
-import { honchoEnabled, resolveHonchoScope, recordHonchoTurn } from "../../lib/honcho.js";
+import { honchoEnabled, resolveHonchoScope, recordHonchoTurn, honchoRecall } from "../../lib/honcho.js";
 import { handleApprovalButton } from "../notifications/approvals.js";
 import type { ActiveQuery } from "../../lib/types.js";
 
@@ -207,6 +207,11 @@ async function runChatInBackground(
         return null;
       })
     : null;
+  // Plugin-recall: fetch a memory snapshot to inject at the system level.
+  const memoryContext = honchoScope
+    ? (await honchoRecall(ctx, honchoScope, messageText)) ?? undefined
+    : undefined;
+  if (memoryContext) ctx.logger.info(`Honcho recall: injected ${memoryContext.length} chars`);
 
   try {
     // Known non-editable chat: no streaming possible — run to completion and
@@ -218,6 +223,7 @@ async function runChatInBackground(
         resumeSessionId,
         channelUserId: userId,
         honcho: honchoScope ?? undefined,
+        memoryContext,
       });
       logDone(ctx, agentId, result);
       await saveSession(ctx, userId, agentId, result.sessionId);
@@ -259,6 +265,7 @@ async function runChatInBackground(
       resumeSessionId,
       channelUserId: userId,
       honcho: honchoScope ?? undefined,
+        memoryContext,
     });
     logDone(ctx, agentId, result);
     await saveSession(ctx, userId, agentId, result.sessionId);
