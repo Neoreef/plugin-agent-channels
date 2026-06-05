@@ -5,26 +5,63 @@
  * and streams the response back via message edit-in-place.
  */
 
+import { writeFileSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import type { PluginContext } from "@paperclipai/plugin-sdk";
 import { resolveBot } from "./bot-mapping.js";
 import {
   sendCliqMessage,
+  sendCliqChatMessage,
   getChatEditCapability,
   setChatEditCapability,
+  downloadCliqFile,
 } from "../../lib/cliq-client.js";
 import { runAgentChat, type HarnessEvent } from "../../lib/harness.js";
 import { createCliqDraftStream } from "../../lib/draft-stream.js";
-import { getResumeSession, saveSession } from "./session-store.js";
+import {
+  getResumeSession,
+  saveSession,
+  dmConversationKey,
+  channelConversationKey,
+} from "./session-store.js";
 import { honchoEnabled, resolveHonchoScope, recordHonchoTurn, honchoRecall } from "../../lib/honcho.js";
 import { handleApprovalButton } from "../notifications/approvals.js";
+import {
+  noteHumanParticipant,
+  recordChannelBot,
+  getChannelParticipants,
+  renderRoster,
+} from "./roster.js";
+import {
+  isBotSender,
+  resolveMessageDepth,
+  checkGuardrails,
+  recordAgentMessage,
+} from "./guardrails.js";
+import { readGroupsConfig, resolveGroupPolicy } from "./group-policy.js";
 import type { ActiveQuery } from "../../lib/types.js";
 
-/** Active queries — prevents concurrent sessions per user+agent */
-const activeQueries = new Map<string, ActiveQuery>();
-
-function queryKey(userId: string, agentId: string): string {
-  return `${userId}:${agentId}`;
+/** Per-channel rolling history of recent messages (sender + text), for context
+ *  injection — including messages an agent saw but didn't respond to (not
+ *  @mentioned). In-memory, capped per channel. */
+const CHANNEL_HISTORY_LIMIT = 15;
+const channelHistory = new Map<string, Array<{ sender: string; text: string }>>();
+function recordChannelHistory(channelId: string, sender: string, text: string): void {
+  if (!text.trim()) return;
+  const arr = channelHistory.get(channelId) ?? [];
+  arr.push({ sender, text: text.slice(0, 500) });
+  while (arr.length > CHANNEL_HISTORY_LIMIT) arr.shift();
+  channelHistory.set(channelId, arr);
 }
+function renderChannelHistory(channelId: string): string | undefined {
+  const arr = channelHistory.get(channelId);
+  if (!arr || arr.length === 0) return undefined;
+  return `Recent messages in this channel:\n${arr.map((m) => `${m.sender}: ${m.text}`).join("\n")}`;
+}
+
+/** Active queries — prevents concurrent runs per conversation (keyed by convKey). */
+const activeQueries = new Map<string, ActiveQuery>();
 
 /**
  * Sanitize Cliq webhook payload.
@@ -44,13 +81,96 @@ type CliqWebhookPayload = {
   sender?: { id?: string; name?: string; email?: string };
   // Older/alternative shape
   bot?: { unique_name?: string; name?: string };
-  chat?: { id?: string; type?: string };
+  chat?: { id?: string; type?: string; title?: string; channel_unique_name?: string };
+  // Channel/group fields (present for channel messages)
+  channel?: { unique_name?: string; name?: string };
+  // @mentions in the message (Deluge sends these for channel messages)
+  mentions?: Array<{ name?: string; id?: string; bot_unique_name?: string }>;
+  // Self-relay markers (a bot's own/teammate reply re-entering as a channel msg)
+  _relay?: boolean;
+  _relayDepth?: number;
+  operation?: string; // "message_sent" | "added" | "removed" | ...
   message?: string;
   text?: string;
   type?: string;
   // Button callbacks (Deluge agentChannelsButtonCallback): { type, key }
   key?: string;
+  // Rich context the Deluge handlers send (skill: zoho-cliq-messaging)
+  message_details?: {
+    message?: {
+      text?: string;
+      content?: { text?: string };
+      file?: CliqFile;
+      replied_message?: { text?: string; sender?: { name?: string }; file?: CliqFile };
+    };
+  };
+  attachments?: CliqFile[];
+  // Reactions (only present once a Deluge reaction handler is added — see #30)
+  reactions?: Array<{ emoji?: string; name?: string; user?: { name?: string } }>;
 };
+
+/** A Cliq file attachment — download via `url` (the hash `id` doesn't work). */
+type CliqFile = { name?: string; id?: string; type?: string; url?: string };
+
+/** Pull reply context + file attachments + reactions out of the payload. */
+function extractCliqContext(payload: CliqWebhookPayload): {
+  repliedText?: string;
+  files: CliqFile[];
+  reactions: string[];
+} {
+  const msg = payload.message_details?.message;
+  const repliedText = msg?.replied_message?.text?.trim() || undefined;
+  const files: CliqFile[] = [];
+  if (msg?.file?.url) files.push(msg.file);
+  if (msg?.replied_message?.file?.url) files.push(msg.replied_message.file);
+  for (const f of payload.attachments ?? []) if (f?.url) files.push(f);
+  const reactions = (payload.reactions ?? [])
+    .map((r) => r.emoji || r.name || "")
+    .filter(Boolean);
+  return { repliedText, files, reactions };
+}
+
+type ChannelContext = {
+  isChannel: boolean;
+  channelId: string;
+  channelName: string;
+  channelLabel: string;
+  mentions: Array<{ name?: string; id?: string; bot_unique_name?: string }>;
+  senderIsBot: boolean;
+  relayDepth: number;
+};
+
+/** Detect channel vs DM and pull the channel routing fields out of the payload. */
+function extractChannelContext(
+  payload: CliqWebhookPayload,
+  chatId: string | undefined,
+  senderId: string | undefined,
+): ChannelContext {
+  const channelName = payload.channel?.unique_name ?? payload.chat?.channel_unique_name ?? "";
+  const isChannel = Boolean(channelName || payload.chat?.type === "channel");
+  // Prefer a stable id for keying: chatId, else the channel unique name.
+  const channelId = chatId || channelName;
+  const channelLabel = payload.chat?.title || payload.channel?.name || (channelName ? `#${channelName}` : "channel");
+  return {
+    isChannel,
+    channelId,
+    channelName,
+    channelLabel,
+    mentions: payload.mentions ?? [],
+    senderIsBot: isBotSender(senderId, payload._relay),
+    relayDepth: payload._relayDepth ?? 0,
+  };
+}
+
+/** Was this bot @mentioned in the message? */
+function botWasMentioned(
+  mentions: Array<{ name?: string; id?: string; bot_unique_name?: string }>,
+  botUniqueName: string,
+): boolean {
+  return mentions.some(
+    (m) => m.bot_unique_name === botUniqueName || m.name === botUniqueName || m.id === botUniqueName,
+  );
+}
 
 export async function handleCliqWebhook(
   ctx: PluginContext,
@@ -94,7 +214,11 @@ export async function handleCliqWebhook(
     if (handled) return;
   }
 
-  if (!messageText.trim()) {
+  const { repliedText, files, reactions } = extractCliqContext(payload);
+
+  // Allow file-only / reply-only / reaction-only messages (empty text is valid
+  // when a file is attached — skill: zoho-cliq-messaging).
+  if (!messageText.trim() && files.length === 0 && !repliedText && reactions.length === 0) {
     ctx.logger.info(`Cliq webhook: empty message from ${userName}, ignoring`);
     return;
   }
@@ -113,32 +237,71 @@ export async function handleCliqWebhook(
   }
 
   const { agentId, companyId } = resolved;
-  const key = queryKey(userId, agentId);
+  const chatId = (payload.chat as { id?: string } | undefined)?.id;
+  const ch = extractChannelContext(payload, chatId, userId);
 
-  // Concurrent query guard
-  const existing = activeQueries.get(key);
+  // ─── Group-channel gating (policy · mention · flywheel) ─────────────────────
+  let attributedText = messageText;
+  let rosterContext: string | undefined;
+  let channelGuidance: string | undefined;
+  if (ch.isChannel) {
+    const groups = await readGroupsConfig(ctx);
+    const policy = resolveGroupPolicy(groups, ch.channelId, ch.channelName);
+    if (!policy.enabled) {
+      ctx.logger.info(`Cliq channel ${ch.channelLabel}: policy disabled, ignoring`);
+      return;
+    }
+    channelGuidance = policy.channelGuidance;
+
+    // Roster: record this bot + (human) speaker; buffer every message for context.
+    recordChannelBot(ch.channelId, { botUniqueName, agentId, displayName: botDisplayName });
+    if (!ch.senderIsBot) noteHumanParticipant(ch.channelId, { id: userId, name: userName, email: payload.sender?.email ?? payload.user?.email });
+    recordChannelHistory(ch.channelId, ch.senderIsBot ? `${userName} (agent)` : userName, messageText);
+
+    // Mention gating: when required and this bot isn't @mentioned, stay silent
+    // (the message is already buffered above for later context).
+    if (policy.requireMention && !botWasMentioned(ch.mentions, botUniqueName)) {
+      ctx.logger.info(`Cliq channel ${ch.channelLabel}: ${botUniqueName} not mentioned, buffering only`);
+      return;
+    }
+
+    // Flywheel guardrails (broadcast mode): bound bot↔bot depth + hourly volume.
+    if (!policy.requireMention) {
+      const depth = resolveMessageDepth({ senderIsBotMessage: ch.senderIsBot, parentDepth: ch.relayDepth });
+      const gr = checkGuardrails({ agentId, channelId: ch.channelId, depth, config: policy.guardrails });
+      if (!gr.allowed) {
+        ctx.logger.info(`Cliq channel ${ch.channelLabel}: guardrail blocked ${botUniqueName} (${gr.reason})`);
+        return;
+      }
+    }
+
+    // Sender attribution — each agent sees who said what.
+    if (messageText.trim()) attributedText = `${userName}: ${messageText}`;
+    rosterContext = renderRoster(ch.channelId, ch.channelLabel, botUniqueName);
+  }
+
+  // Conversation key: per (channel, agent) for groups, per (user, agent) for DMs.
+  const convKey = ch.isChannel ? channelConversationKey(ch.channelId, agentId) : dmConversationKey(userId, agentId);
+
+  // Concurrent query guard (keyed per conversation).
+  const existing = activeQueries.get(convKey);
   if (existing) {
     const elapsed = Date.now() - existing.startedAt;
     if (elapsed < 10 * 60_000) {
-      await sendCliqMessage(
-        ctx,
-        botUniqueName,
-        userId,
-        `I'm still working on your previous request. Please wait for it to finish.`,
-      );
+      // In a channel, stay quiet (the message is buffered); in a DM, tell the user.
+      if (!ch.isChannel) {
+        await sendCliqMessage(ctx, botUniqueName, userId, `I'm still working on your previous request. Please wait for it to finish.`);
+      }
       return;
     }
-    // Stale — allow override
-    activeQueries.delete(key);
+    activeQueries.delete(convKey); // stale — allow override
   }
 
-  ctx.logger.info(`Cliq: ${userName} → ${botUniqueName} (agent=${agentId}): "${messageText.slice(0, 100)}"`);
-
-  const chatId = (payload.chat as { id?: string } | undefined)?.id;
+  ctx.logger.info(`Cliq: ${userName} → ${botUniqueName} (agent=${agentId}${ch.isChannel ? `, ${ch.channelLabel}` : ""}): "${messageText.slice(0, 100)}"`);
 
   // Mark active BEFORE returning so a rapid follow-up message hits the
   // concurrent-query guard above.
-  activeQueries.set(key, { userId, agentId, sessionId: "", startedAt: Date.now() });
+  activeQueries.set(convKey, { userId, agentId, sessionId: "", startedAt: Date.now() });
 
   // CRITICAL: do NOT await the harness here. The host's webhook RPC has a ~30s
   // budget, but an agent turn (persona + tools + model latency) routinely runs
@@ -147,28 +310,75 @@ export async function handleCliqWebhook(
   // webhook returns immediately and the reply is delivered later via the Cliq
   // API (bot message / edit-in-place), which works any time the worker is alive.
   void runChatInBackground(ctx, {
-    key,
+    convKey,
     chatId,
     botUniqueName,
     userId,
+    userName,
     agentId,
     companyId,
     messageText,
+    attributedText,
+    repliedText,
+    files,
+    reactions,
+    channel: ch.isChannel
+      ? { channelId: ch.channelId, channelName: ch.channelName, channelLabel: ch.channelLabel, rosterContext, channelGuidance }
+      : undefined,
   }).catch((err) => {
     ctx.logger.error(`Cliq background chat crashed: ${String(err)}`);
-    activeQueries.delete(key);
+    activeQueries.delete(convKey);
   });
 }
 
 type BackgroundChatArgs = {
-  key: string;
+  convKey: string;
   chatId: string | undefined;
   botUniqueName: string;
   userId: string;
+  userName: string;
   agentId: string;
   companyId: string;
   messageText: string;
+  /** messageText prefixed with the speaker name in channels (for the agent). */
+  attributedText?: string;
+  repliedText?: string;
+  files?: CliqFile[];
+  reactions?: string[];
+  /** Present only for channel/group messages. */
+  channel?: {
+    channelId: string;
+    channelName: string;
+    channelLabel: string;
+    rosterContext?: string;
+    channelGuidance?: string;
+  };
 };
+
+/**
+ * Build the per-turn context the agent needs beyond its message: the replied-to
+ * message (#29), downloaded attachments (#28 — images saved locally so the agent
+ * can view them), and reactions (#30). Returned as plain text to prepend to the
+ * prompt; the raw user message is kept separate (for memory).
+ */
+async function buildTurnContext(ctx: PluginContext, args: BackgroundChatArgs): Promise<string> {
+  const parts: string[] = [];
+  if (args.repliedText) parts.push(`[The user is replying to an earlier message: "${args.repliedText}"]`);
+  for (const f of args.files ?? []) {
+    if (!f.url) continue;
+    const isImage = (f.type ?? "").toLowerCase().startsWith("image/");
+    const bytes = await downloadCliqFile(ctx, f.url);
+    if (!bytes) { parts.push(`[The user attached "${f.name ?? "a file"}" but it could not be downloaded.]`); continue; }
+    const safe = (f.name ?? "cliq-file").replace(/[^a-zA-Z0-9._-]+/g, "_");
+    const p = path.join(os.tmpdir(), `cliq-${Date.now()}-${safe}`);
+    try { writeFileSync(p, bytes); } catch { continue; }
+    parts.push(isImage
+      ? `[The user attached an image "${f.name ?? "image"}", saved locally at ${p} — open/read that file to view it.]`
+      : `[The user attached a file "${f.name ?? "file"}" (${f.type ?? "unknown"}), saved at ${p}.]`);
+  }
+  if (args.reactions?.length) parts.push(`[The user reacted with: ${args.reactions.join(" ")}]`);
+  return parts.join("\n");
+}
 
 /** "WriteFile" / "web_search" → "Write File" / "Web Search" for the tool card. */
 function titleCaseTool(name: string): string {
@@ -193,32 +403,56 @@ async function runChatInBackground(
   ctx: PluginContext,
   args: BackgroundChatArgs,
 ): Promise<void> {
-  const { key, chatId, botUniqueName, userId, agentId, companyId, messageText } = args;
+  const { convKey, chatId, botUniqueName, userId, agentId, companyId, messageText } = args;
+  const ch = args.channel;
   const editable = chatId ? getChatEditCapability(chatId) : null;
 
-  // Resume this user's prior session with this agent for multi-turn memory.
-  const resumeSessionId = await getResumeSession(ctx, userId, agentId);
+  // Resume this conversation's prior session for multi-turn memory (per channel
+  // for groups, per user for DMs).
+  const resumeSessionId = await getResumeSession(ctx, convKey);
 
-  // Honcho memory scope (workspace/user/agent peers) — resolved once, used for
-  // plugin-write (and passed to the harness for the optional MCP tools path).
+  // Honcho memory scope — group-aware: a channel-keyed multi-peer session whose
+  // peers are all known participants; a per-(user,agent) session for DMs.
   const honchoScope = honchoEnabled()
-    ? await resolveHonchoScope(ctx, { companyId, agentId, channelUserId: userId }).catch((e) => {
+    ? await resolveHonchoScope(ctx, {
+        companyId,
+        agentId,
+        channelUserId: userId,
+        group: ch
+          ? { channelId: ch.channelId, participantCliqIds: getChannelParticipants(ch.channelId).map((p) => p.id) }
+          : undefined,
+      }).catch((e) => {
         ctx.logger.info(`Honcho scope resolve failed: ${String(e)}`);
         return null;
       })
     : null;
-  // Plugin-recall: fetch a memory snapshot to inject at the system level.
-  const memoryContext = honchoScope
-    ? (await honchoRecall(ctx, honchoScope, messageText)) ?? undefined
-    : undefined;
-  if (memoryContext) ctx.logger.info(`Honcho recall: injected ${memoryContext.length} chars`);
+  // Plugin-recall about the current speaker. Combined with channel guidance,
+  // the roster, and recent channel history into the system-level context.
+  const honchoRecallText = honchoScope ? (await honchoRecall(ctx, honchoScope, messageText)) ?? undefined : undefined;
+  const memoryContext = [
+    ch?.channelGuidance,
+    ch?.rosterContext,
+    ch ? renderChannelHistory(ch.channelId) : undefined,
+    honchoRecallText,
+  ].filter((s) => s && s.trim()).join("\n\n") || undefined;
+  if (memoryContext) ctx.logger.info(`Context injected: ${memoryContext.length} chars${ch ? " (channel)" : ""}`);
+
+  // Enrich the prompt with reply context + downloaded attachments + reactions
+  // (#28/#29/#30). In channels the message is sender-attributed ("Name: text");
+  // the raw messageText is kept for memory.
+  const turnContext = await buildTurnContext(ctx, args);
+  const agentMessage = args.attributedText ?? messageText;
+  const agentPrompt = [turnContext, agentMessage].filter((s) => s && s.trim()).join("\n\n")
+    || "[The user sent an attachment with no message text.]";
+  if (turnContext) ctx.logger.info(`Cliq context: ${turnContext.slice(0, 120).replace(/\n/g, " ")}`);
 
   try {
-    // Known non-editable chat: no streaming possible — run to completion and
-    // deliver once as a plain message.
-    if (editable === false) {
+    // Channel/group path: deliver the final answer to the CHANNEL (no in-place
+    // card stream yet — the draft stream is DM-card oriented). Posts via the
+    // chat id so every participant sees it.
+    if (ch) {
       const result = await runAgentChat(ctx, { agentId, companyId }, {
-        prompt: messageText,
+        prompt: agentPrompt,
         timeoutMs: 300_000,
         resumeSessionId,
         channelUserId: userId,
@@ -226,7 +460,30 @@ async function runChatInBackground(
         memoryContext,
       });
       logDone(ctx, agentId, result);
-      await saveSession(ctx, userId, agentId, result.sessionId);
+      await saveSession(ctx, convKey, result.sessionId);
+      const finalText = finalTextOf(result);
+      if (chatId) await sendCliqChatMessage(ctx, chatId, finalText);
+      else await sendCliqMessage(ctx, botUniqueName, userId, finalText); // fallback
+      // Buffer our own reply for channel context + count it against the flywheel.
+      recordChannelHistory(ch.channelId, `${botUniqueName} (agent)`, result.text);
+      recordAgentMessage(agentId, ch.channelId);
+      if (honchoScope) await recordHonchoTurn(ctx, honchoScope, messageText, result.text);
+      return;
+    }
+
+    // Known non-editable chat: no streaming possible — run to completion and
+    // deliver once as a plain message.
+    if (editable === false) {
+      const result = await runAgentChat(ctx, { agentId, companyId }, {
+        prompt: agentPrompt,
+        timeoutMs: 300_000,
+        resumeSessionId,
+        channelUserId: userId,
+        honcho: honchoScope ?? undefined,
+        memoryContext,
+      });
+      logDone(ctx, agentId, result);
+      await saveSession(ctx, convKey, result.sessionId);
       await sendCliqMessage(ctx, botUniqueName, userId, finalTextOf(result));
       if (honchoScope) await recordHonchoTurn(ctx, honchoScope, messageText, result.text);
       return;
@@ -268,7 +525,7 @@ async function runChatInBackground(
         memoryContext,
     });
     logDone(ctx, agentId, result);
-    await saveSession(ctx, userId, agentId, result.sessionId);
+    await saveSession(ctx, convKey, result.sessionId);
 
     // Finalize: render the authoritative final text and stop the stream.
     const finalText = finalTextOf(result);
@@ -298,7 +555,7 @@ async function runChatInBackground(
       `Sorry, I encountered an error: ${String(err).slice(0, 200)}`,
     );
   } finally {
-    activeQueries.delete(key);
+    activeQueries.delete(convKey);
   }
 }
 

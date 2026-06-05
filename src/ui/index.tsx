@@ -4,6 +4,7 @@ import {
   usePluginData,
   type PluginSettingsPageProps,
 } from "@paperclipai/plugin-sdk/ui";
+import { CLIQ_SCOPES } from "../constants.js";
 
 // ─── Styles ─────────────────────────────────────────────────────────────────
 
@@ -63,7 +64,10 @@ const AVAILABLE_CHANNELS: ServiceDef[] = [
     type: "zoho-cliq", name: "Zoho Cliq",
     description: "Agent chat through Zoho Cliq bots",
     status: "available", authType: "oauth", provider: "zoho",
-    scopes: "ZohoCliq.Messages.CREATE,ZohoCliq.Messages.READ,ZohoCliq.Messages.UPDATE,ZohoCliq.Messages.DELETE,ZohoCliq.Webhooks.CREATE,ZohoCliq.Webhooks.UPDATE,ZohoCliq.Bots.READ,ZohoCliq.messageactions.READ,ZohoCliq.messageactions.CREATE,ZohoCliq.messageactions.DELETE,ZohoCliq.Channels.READ,ZohoCliq.Chats.READ,ZohoCliq.Attachments.READ,ZohoCliq.StorageData.ALL",
+    // Single source of truth — kept in sync with the worker's CLIQ_SCOPES so
+    // the consent URL always requests exactly what the bot uses (incl. the
+    // org/users-read scopes for name resolution).
+    scopes: CLIQ_SCOPES,
   },
   { type: "microsoft-teams", name: "Microsoft Teams", description: "Bot conversations in Teams", status: "coming-soon", authType: "oauth", provider: "microsoft" },
   { type: "discord", name: "Discord", description: "Bot commands in Discord servers", status: "coming-soon", authType: "oauth", provider: "discord" },

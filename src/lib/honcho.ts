@@ -55,20 +55,38 @@ function honchoMcpTsx(): string {
 
 export interface HonchoScope {
   workspaceId: string;
+  /** The CURRENT speaker's peer (the user in a DM; the speaking participant in a channel). */
   userPeer: string;
   agentPeer: string;
   sessionId: string;
   baseUrl: string;
+  /** Present for channel/group turns: every known participant peer for the
+   *  shared channel session (humans observe_me+others; agent observe_others). */
+  groupPeers?: string[];
+}
+
+/** Resolve a Cliq user id → Honcho peer (user_<paperclipId> if mapped, else raw id). */
+async function peerForCliqUser(ctx: PluginContext, channelUserId: string): Promise<string> {
+  const paperclipUserId = await resolvePaperclipUserFromCliq(ctx, channelUserId).catch(() => null);
+  return paperclipUserId ? peerIdForUser(paperclipUserId) : channelUserId;
 }
 
 /**
- * Resolve the (workspace, user peer, agent peer, session) ids for a turn.
- * IsLocal? a Cliq user mapped to a Paperclip user → `user_<paperclipId>`,
- * otherwise the raw channel user id (per the design diagram).
+ * Resolve the (workspace, peers, session) ids for a turn.
+ *  - DM: session keyed per (user, agent); peers = {user, agent}.
+ *  - channel (group present): session keyed per (agent, channel); peers = all
+ *    known participants + agent; userPeer = the current speaker.
+ * A Cliq user mapped to a Paperclip user → `user_<paperclipId>`, else the raw id.
  */
 export async function resolveHonchoScope(
   ctx: PluginContext,
-  params: { companyId: string; agentId: string; agentName?: string | null; channelUserId: string },
+  params: {
+    companyId: string;
+    agentId: string;
+    agentName?: string | null;
+    channelUserId: string;
+    group?: { channelId: string; participantCliqIds: string[] };
+  },
 ): Promise<HonchoScope> {
   let companyName: string | null = null;
   try {
@@ -85,13 +103,20 @@ export async function resolveHonchoScope(
 
   const workspaceId = workspaceIdForCompany(params.companyId, DEFAULT_WORKSPACE_PREFIX, companyName);
   const agentPeer = peerIdForAgent(params.agentId, agentName);
+  const userPeer = await peerForCliqUser(ctx, params.channelUserId);
 
-  const paperclipUserId = await resolvePaperclipUserFromCliq(ctx, params.channelUserId).catch(() => null);
-  const userPeer = paperclipUserId ? peerIdForUser(paperclipUserId) : params.channelUserId;
+  if (params.group) {
+    // Channel session: one transcript per (agent, channel), shared across speakers.
+    const sessionId = `cliq_chan_${hashId(`${agentPeer}|${params.group.channelId}`).slice(0, 16)}`;
+    const ids = new Set(params.group.participantCliqIds);
+    ids.add(params.channelUserId); // ensure the speaker is included
+    const resolved = await Promise.all([...ids].map((id) => peerForCliqUser(ctx, id)));
+    const groupPeers = [...new Set(resolved)];
+    return { workspaceId, userPeer, agentPeer, sessionId, baseUrl: honchoBaseUrl(), groupPeers };
+  }
 
   // Stable per (user, agent) memory session so the transcript accumulates.
   const sessionId = `cliq_${hashId(`${userPeer}|${agentPeer}`).slice(0, 16)}`;
-
   return { workspaceId, userPeer, agentPeer, sessionId, baseUrl: honchoBaseUrl() };
 }
 
@@ -116,6 +141,26 @@ export async function recordHonchoTurn(
       body: JSON.stringify(body),
     });
   try {
+    if (scope.groupPeers && scope.groupPeers.length) {
+      // Channel: get-or-create the session, then idempotently add every known
+      // participant (handles late joiners) — humans observe; agent observes
+      // others. POST /sessions/{id}/peers auto-creates peers.
+      const peerMap: Record<string, { observe_me: boolean; observe_others: boolean }> = {
+        [scope.agentPeer]: { observe_me: false, observe_others: true },
+      };
+      for (const p of scope.groupPeers) peerMap[p] = { observe_me: true, observe_others: true };
+      await postJson(`${base}/sessions`, { id: scope.sessionId });
+      await postJson(`${base}/sessions/${encodeURIComponent(scope.sessionId)}/peers`, peerMap);
+      // Attribute the message to the SPEAKER's peer.
+      await postJson(`${base}/sessions/${encodeURIComponent(scope.sessionId)}/messages`, {
+        messages: [
+          { peer_id: scope.userPeer, content: userMessage },
+          { peer_id: scope.agentPeer, content: agentReply },
+        ],
+      });
+      ctx.logger.info(`Honcho: recorded channel turn → ${scope.workspaceId}/${scope.sessionId} (${scope.userPeer} → ${scope.agentPeer}, ${scope.groupPeers.length} peers)`);
+      return;
+    }
     // 1. get-or-create session + peers (idempotent; auto-creates the peers).
     await postJson(`${base}/sessions`, {
       id: scope.sessionId,

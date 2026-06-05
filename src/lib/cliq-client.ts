@@ -168,7 +168,7 @@ async function cliqFetch(
   method: string,
   url: string,
   body: unknown | undefined,
-  opts?: { maxWaitMs?: number; skipRateLimit?: boolean },
+  opts?: { maxWaitMs?: number; skipRateLimit?: boolean; serviceId?: string },
 ): Promise<{ status: number; data: unknown }> {
   if (opts?.skipRateLimit) {
     recordSlotUsage();
@@ -179,7 +179,7 @@ async function cliqFetch(
     }
   }
 
-  const { token, dataCenter } = await getAccessToken(ctx);
+  const { token, dataCenter } = await getAccessToken(ctx, opts?.serviceId);
   const center = DATA_CENTERS[dataCenter] ?? DATA_CENTERS.US;
   const fullUrl = url.startsWith("https://") ? url : `https://${center.cliq}/api/v2${url}`;
 
@@ -216,7 +216,7 @@ async function cliqFetch(
   }
 
   if (res.status === 401) {
-    const newToken = await refreshAccessToken(ctx);
+    const newToken = await refreshAccessToken(ctx, opts?.serviceId);
     headers.Authorization = `Zoho-oauthtoken ${newToken}`;
     res = await httpFetch({ ...init, headers });
     if (res.status === 429) recordLockout(10 * 60_000);
@@ -297,6 +297,33 @@ function extractBotDmMessageRef(data: unknown, userId: string): CliqMessageRef {
     chatId: decodeId(details?.chat_id ?? details?.chatId ?? root?.chat_id),
     messageId: decodeId(details?.message_id ?? details?.messageId ?? root?.message_id ?? root?.id),
   };
+}
+
+// ─── Download an inbound file attachment ─────────────────────────────────────
+
+/**
+ * Download a Cliq file attachment by its `url` (NOT the hash id — only the url
+ * works), authenticated with the OAuth token (needs ZohoCliq.Attachments.READ).
+ * Returns the raw bytes, or null on failure.
+ */
+export async function downloadCliqFile(ctx: PluginContext, url: string): Promise<Buffer | null> {
+  try {
+    const { token } = await getAccessToken(ctx);
+    const res = await ctx.http.fetch(url, {
+      method: "GET",
+      headers: { Authorization: `Zoho-oauthtoken ${token}` },
+    });
+    const status = (res as { status?: number }).status ?? 200;
+    if (status >= 400) {
+      ctx.logger.info(`Cliq file download ${status} for ${url.slice(0, 80)}`);
+      return null;
+    }
+    const ab = await (res as unknown as { arrayBuffer: () => Promise<ArrayBuffer> }).arrayBuffer();
+    return Buffer.from(ab);
+  } catch (e) {
+    ctx.logger.info(`Cliq file download failed: ${String(e)}`);
+    return null;
+  }
 }
 
 // ─── Send plain text message ─────────────────────────────────────────────────
@@ -422,30 +449,69 @@ export async function deleteCliqMessage(
 
 export type CliqUser = { id: string; name: string; email?: string };
 
-/** Best-effort list of Zoho Cliq org users. Returns [] on error/empty. */
-export async function listCliqUsers(ctx: PluginContext): Promise<CliqUser[]> {
-  const { status, data } = await cliqFetch(ctx, "GET", "/users", undefined);
-  if (status < 200 || status >= 300) {
-    ctx.logger.info(`listCliqUsers: HTTP ${status}`);
-    return [];
+/** Map one raw Cliq /users row to a CliqUser, or null if it has no id. */
+function toCliqUser(u: Record<string, unknown>): CliqUser | null {
+  const id = u.id ?? u.user_id ?? u.zuid ?? u.zoid;
+  if (id == null) return null;
+  const first = typeof u.first_name === "string" ? u.first_name : "";
+  const last = typeof u.last_name === "string" ? u.last_name : "";
+  // Cliq returns `display_name` (only when requested via ?fields=display_name)
+  // and `email_id`; fall back to first/last, then email, then the raw id.
+  const email =
+    (typeof u.email_id === "string" && u.email_id) ||
+    (typeof u.email === "string" && u.email) ||
+    "";
+  const name =
+    (typeof u.display_name === "string" && u.display_name) ||
+    (typeof u.name === "string" && u.name) ||
+    [first, last].filter(Boolean).join(" ") ||
+    email ||
+    String(id);
+  const user: CliqUser = { id: String(id), name };
+  if (email) user.email = email;
+  return user;
+}
+
+/**
+ * Best-effort list of Zoho Cliq org users (id → display name/email), for the
+ * notify-mapping UI. Requests `display_name` explicitly (Cliq omits it
+ * otherwise) and paginates via `next_token`. Returns [] on error/empty.
+ * Requires the ZohoCliq.Users.READ / ZohoCliq.Organisation.READ scope — a
+ * connection consented before those were added returns 401/"not authorised".
+ */
+export async function listCliqUsers(ctx: PluginContext, serviceId?: string): Promise<CliqUser[]> {
+  const out: CliqUser[] = [];
+  const seen = new Set<string>();
+  let nextToken: string | undefined;
+  // Cap pages so a misbehaving cursor can't loop forever (100/page × 20 = 2000).
+  for (let page = 0; page < 20; page++) {
+    const params = new URLSearchParams({ fields: "display_name", limit: "100" });
+    if (nextToken) params.set("next_token", nextToken);
+    const { status, data } = await cliqFetch(ctx, "GET", `/users?${params.toString()}`, undefined, {
+      serviceId,
+    });
+    if (status < 200 || status >= 300) {
+      ctx.logger.info(`listCliqUsers: HTTP ${status}${page > 0 ? ` (after ${out.length} users)` : ""}`);
+      break;
+    }
+    const root = (data ?? {}) as Record<string, unknown>;
+    const rows =
+      (Array.isArray(root.users) && root.users) ||
+      (Array.isArray(root.data) && root.data) ||
+      (Array.isArray(data) ? (data as unknown[]) : []);
+    for (const r of rows as Array<Record<string, unknown>>) {
+      const user = toCliqUser(r);
+      if (user && !seen.has(user.id)) {
+        seen.add(user.id);
+        out.push(user);
+      }
+    }
+    const tok = root.next_token ?? root.sync_token;
+    const hasMore = root.has_more === true || (typeof tok === "string" && tok.length > 0);
+    if (!hasMore || typeof tok !== "string" || !tok) break;
+    nextToken = tok;
   }
-  const rows = (data as { data?: unknown[] } | undefined)?.data ?? (Array.isArray(data) ? data : []);
-  return (rows as Array<Record<string, unknown>>)
-    .map((u): CliqUser | null => {
-      const id = u.id ?? u.user_id ?? u.zuid;
-      if (id == null) return null;
-      const first = typeof u.first_name === "string" ? u.first_name : "";
-      const last = typeof u.last_name === "string" ? u.last_name : "";
-      const name =
-        (typeof u.name === "string" && u.name) ||
-        [first, last].filter(Boolean).join(" ") ||
-        (typeof u.email === "string" ? u.email : "") ||
-        String(id);
-      const user: CliqUser = { id: String(id), name };
-      if (typeof u.email === "string") user.email = u.email;
-      return user;
-    })
-    .filter((u): u is CliqUser => u !== null);
+  return out;
 }
 
 // ─── Chunked send ────────────────────────────────────────────────────────────

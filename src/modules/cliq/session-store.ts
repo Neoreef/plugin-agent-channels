@@ -21,8 +21,16 @@ const TTL_MS = 6 * 60 * 60_000; // 6 hours
 type SessionEntry = { sessionId: string; updatedAt: number };
 type SessionMap = Record<string, SessionEntry>;
 
-function sessionKey(userId: string, agentId: string): string {
+/**
+ * Conversation key — the unit a harness session resumes within. DMs are keyed
+ * per (user, agent); group channels per (channel, agent) so the agent keeps one
+ * working context for the whole channel rather than one per speaker.
+ */
+export function dmConversationKey(userId: string, agentId: string): string {
   return `${userId}:${agentId}`;
+}
+export function channelConversationKey(channelId: string, agentId: string): string {
+  return `chan:${channelId}:${agentId}`;
 }
 
 async function readAll(ctx: PluginContext): Promise<SessionMap> {
@@ -30,13 +38,12 @@ async function readAll(ctx: PluginContext): Promise<SessionMap> {
   return all ?? {};
 }
 
-/** The harness session to resume for this user+agent, or undefined if none/stale. */
+/** The harness session to resume for this conversation, or undefined if none/stale. */
 export async function getResumeSession(
   ctx: PluginContext,
-  userId: string,
-  agentId: string,
+  convKey: string,
 ): Promise<string | undefined> {
-  const entry = (await readAll(ctx))[sessionKey(userId, agentId)];
+  const entry = (await readAll(ctx))[convKey];
   if (!entry) return undefined;
   if (Date.now() - entry.updatedAt > TTL_MS) return undefined;
   return entry.sessionId;
@@ -45,13 +52,12 @@ export async function getResumeSession(
 /** Persist the session id from a completed turn (prunes stale entries). */
 export async function saveSession(
   ctx: PluginContext,
-  userId: string,
-  agentId: string,
+  convKey: string,
   sessionId: string | undefined,
 ): Promise<void> {
   if (!sessionId) return;
   const all = await readAll(ctx);
-  all[sessionKey(userId, agentId)] = { sessionId, updatedAt: Date.now() };
+  all[convKey] = { sessionId, updatedAt: Date.now() };
   const cutoff = Date.now() - TTL_MS;
   for (const k of Object.keys(all)) {
     if (all[k].updatedAt < cutoff) delete all[k];

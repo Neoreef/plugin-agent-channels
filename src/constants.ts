@@ -50,4 +50,12 @@ export const CLIQ_SCOPES = [
   "ZohoCliq.Chats.READ",
   "ZohoCliq.Attachments.READ",
   "ZohoCliq.StorageData.ALL",
+  // Org directory read — resolve Cliq user ids → display names for the
+  // notify-mapping UI. Zoho's docs don't pin which scope GET /api/v2/users
+  // checks, so request both (Users.READ for user APIs, Organisation.READ for
+  // org-level reads); extra granted scopes are harmless. NOTE: adding these
+  // requires re-consenting the Cliq OAuth connection — existing tokens won't
+  // carry them.
+  "ZohoCliq.Users.READ",
+  "ZohoCliq.Organisation.READ",
 ].join(",");

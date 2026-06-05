@@ -133,6 +133,15 @@ function asString(v: unknown): string | undefined {
   return typeof v === "string" && v.trim().length > 0 ? v.trim() : undefined;
 }
 
+/**
+ * Raw string passthrough — NEVER trims. Use for accumulating streaming deltas/
+ * chunks: trimming each piece drops the spaces that fall on chunk boundaries
+ * ("I'll run"+"that" → "runthat"). asString() is for whole fields, not deltas.
+ */
+function rawStr(v: unknown): string {
+  return typeof v === "string" ? v : "";
+}
+
 function binFor(envVar: string, fallback: string): string {
   return asString(process.env[envVar]) ?? fallback;
 }
@@ -333,10 +342,10 @@ function makeClaudeStreamParser(): (line: Record<string, unknown>, emit: (e: Har
       const d = (ev.delta as Record<string, unknown> | undefined) ?? {};
       const dt = asString(d.type);
       if (dt === "text_delta") {
-        answer += asString(d.text) ?? "";
+        answer += rawStr(d.text);
         if (answer) emit({ type: "text_delta", text: answer });
       } else if (dt === "thinking_delta") {
-        thinking += asString(d.thinking) ?? "";
+        thinking += rawStr(d.thinking);
         if (thinking) emit({ type: "thinking", text: thinking });
       } else if (dt === "input_json_delta") {
         const tool = tools.get(index);
@@ -519,7 +528,7 @@ export const HARNESS_REGISTRY: Record<string, HarnessSpec> = {
 function textOfContent(content: unknown): string {
   if (typeof content === "string") return content;
   if (Array.isArray(content)) return content.map(textOfContent).join("");
-  if (content && typeof content === "object") return asString((content as Record<string, unknown>).text) ?? "";
+  if (content && typeof content === "object") return rawStr((content as Record<string, unknown>).text);
   return "";
 }
 
@@ -540,13 +549,35 @@ function pickAcpModel(sessionResult: Record<string, unknown> | undefined, cfgMod
   return ids.find((id) => !/lite/i.test(id)) ?? asString(models?.currentModelId) ?? ids[0];
 }
 
-/** Build a tool-card description from an ACP tool_call update's rawInput. */
+/**
+ * Text out of an ACP tool_call `content[]` block. hermes 0.15+ shapes these as
+ * `{type:"content", content:{type:"text", text:"$ date"}}` (a command preview),
+ * so unwrap the inner `content` before falling back to plain text extraction.
+ */
+function acpToolContentText(content: unknown): string {
+  if (!Array.isArray(content)) return textOfContent(content);
+  return content
+    .map((b) => {
+      if (b && typeof b === "object" && "content" in (b as Record<string, unknown>)) {
+        return textOfContent((b as Record<string, unknown>).content);
+      }
+      return textOfContent(b);
+    })
+    .join("");
+}
+
+/** Build a tool-card description from an ACP tool_call update. */
 function summarizeAcpTool(u: Record<string, unknown>): string | undefined {
+  // Older/MCP tools still send a structured rawInput.
   const raw = u.rawInput;
   if (raw && typeof raw === "object") {
     const name = asString(u.kind) ?? asString(u.title) ?? "tool";
     return summarizeToolInput(name, raw as Record<string, unknown>);
   }
+  // hermes 0.15+ drops rawInput; the command/preview lives in content[]
+  // (e.g. "$ date"). Use its first line as the card description.
+  const preview = acpToolContentText(u.content).split(/\r?\n/)[0]?.trim();
+  if (preview) return preview.replace(/^\$\s+/, "").slice(0, 160);
   return undefined;
 }
 
