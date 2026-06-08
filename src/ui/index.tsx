@@ -190,7 +190,7 @@ function OAuthSetup({ serviceId, serviceDef }: { serviceId: string; serviceDef: 
 
   const [clientId, setClientId] = useState("");
   const [clientSecret, setClientSecret] = useState("");
-  const [callbackUrl, setCallbackUrl] = useState("https://cortex.neoreef.com:8443/oauth/callback");
+  const [callbackUrl, setCallbackUrl] = useState("https://cortex.neoreef.com/oauth/callback");
   const [dataCenter, setDataCenter] = useState("US");
   const [configSaved, setConfigSaved] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -301,7 +301,7 @@ function OAuthSetup({ serviceId, serviceDef }: { serviceId: string; serviceDef: 
 
 // ─── Deluge Script Templates ────────────────────────────────────────────────
 
-const WEBHOOK_URL = "https://cortex.neoreef.com:8443/cliq";
+const WEBHOOK_URL = "https://cortex.neoreef.com/cliq";
 
 function delugeMessageHandler(botName: string): string {
   return `bot_name = "${botName}";

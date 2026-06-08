@@ -65,7 +65,7 @@ const manifest: PaperclipPluginManifestV1 = {
         type: "string",
         title: "OAuth Callback URL",
         description:
-          "Full URL for OAuth redirect (e.g. https://cortex.neoreef.com:8443/paperclip/api/plugins/{pluginId}/routes/callback).",
+          "Full URL for OAuth redirect (e.g. https://cortex.neoreef.com/paperclip/api/plugins/{pluginId}/routes/callback).",
       },
       paperclipApiBase: {
         type: "string",
