@@ -15,11 +15,17 @@ import { markdownToCliq } from "./format.js";
 
 const TOKEN_SAFETY_MARGIN_MS = 60_000;
 
-// Shared refresh state to prevent a thundering herd of concurrent refreshes.
+// Per-service refresh state to prevent a thundering herd of concurrent refreshes.
 // Many streaming edits can race to refresh an expired token at once; we collapse
-// them into a single in-flight refresh, and back off if Zoho rate-limits us.
-let refreshInFlight: Promise<string> | null = null;
-let refreshBackoffUntil = 0;
+// them into a single in-flight refresh per service, and back off per service if
+// Zoho rate-limits us. Keying by serviceId keeps concurrent multi-service
+// refreshes independent — one service's refresh (or rate-limit backoff) can't
+// clobber another's in a multi-tenant deployment.
+const refreshInFlight = new Map<string, Promise<string>>();
+const refreshBackoffUntil = new Map<string, number>();
+
+// The legacy global-auth path has no serviceId; bucket those calls together.
+const GLOBAL_REFRESH_KEY = "__global__";
 
 // ─── Per-service auth ────────────────────────────────────────────────────────
 
@@ -65,30 +71,34 @@ async function resolveAuth(ctx: PluginContext, serviceId?: string): Promise<{ au
 }
 
 async function refreshAccessToken(ctx: PluginContext, serviceId?: string): Promise<string> {
-  // Collapse concurrent refreshes into one in-flight request.
-  if (refreshInFlight) return refreshInFlight;
+  const key = serviceId ?? GLOBAL_REFRESH_KEY;
 
-  // Respect Zoho rate-limit backoff.
-  if (Date.now() < refreshBackoffUntil) {
+  // Collapse concurrent refreshes for this service into one in-flight request.
+  const inFlight = refreshInFlight.get(key);
+  if (inFlight) return inFlight;
+
+  // Respect Zoho rate-limit backoff (tracked per service).
+  if (Date.now() < (refreshBackoffUntil.get(key) ?? 0)) {
     // Return the (possibly stale) cached token rather than hammering Zoho.
     const { auth } = await resolveAuth(ctx, serviceId);
     if (auth.accessToken) return auth.accessToken;
     throw new Error("Token refresh backing off after Zoho rate limit");
   }
 
-  refreshInFlight = doRefreshAccessToken(ctx, serviceId)
+  const refresh = doRefreshAccessToken(ctx, serviceId)
     .catch((err) => {
-      // On "too many requests", back off for 10 minutes.
+      // On "too many requests", back off this service for 10 minutes.
       if (String(err).includes("too many requests") || String(err).includes("Access Denied")) {
-        refreshBackoffUntil = Date.now() + 10 * 60_000;
+        refreshBackoffUntil.set(key, Date.now() + 10 * 60_000);
         ctx.logger.error("Zoho refresh rate-limited — backing off 10 min");
       }
       throw err;
     })
     .finally(() => {
-      refreshInFlight = null;
+      refreshInFlight.delete(key);
     });
-  return refreshInFlight;
+  refreshInFlight.set(key, refresh);
+  return refresh;
 }
 
 async function doRefreshAccessToken(ctx: PluginContext, serviceId?: string): Promise<string> {
