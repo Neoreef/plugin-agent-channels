@@ -65,7 +65,7 @@ const manifest: PaperclipPluginManifestV1 = {
         type: "string",
         title: "OAuth Callback URL",
         description:
-          "Full URL for OAuth redirect (e.g. https://cortex.neoreef.com:8443/paperclip/api/plugins/{pluginId}/routes/callback).",
+          "Full URL for OAuth redirect (e.g. https://cortex.neoreef.com/paperclip/api/plugins/{pluginId}/routes/callback).",
       },
       paperclipApiBase: {
         type: "string",
@@ -99,6 +99,14 @@ const manifest: PaperclipPluginManifestV1 = {
       endpointKey: "oauth-callback",
       displayName: "OAuth Callback",
       description: "Receives OAuth authorization code from Zoho",
+    },
+    {
+      // Skeleton second channel — reference template for the channel-module
+      // extension pattern (src/modules/mail/, CHANNELS.md). No-op until
+      // implemented; demonstrates registry dispatch without core edits.
+      endpointKey: "mail-inbound",
+      displayName: "Mail Inbound (template)",
+      description: "Skeleton endpoint demonstrating the channel extension pattern",
     },
   ],
   ui: {

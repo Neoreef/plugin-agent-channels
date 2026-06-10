@@ -16,6 +16,8 @@ export const JOB_KEYS = {
 export const WEBHOOK_KEYS = {
   cliq: "cliq-message",
   oauthCallback: "oauth-callback",
+  // Skeleton second channel — reference template (see src/modules/mail/).
+  mail: "mail-inbound",
 } as const;
 
 /** Zoho data center configuration */

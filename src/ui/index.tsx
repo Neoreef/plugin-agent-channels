@@ -182,15 +182,15 @@ function Autocomplete({
 
 // ─── OAuth Setup Component (reusable per service) ───────────────────────────
 
-function OAuthSetup({ serviceId, serviceDef }: { serviceId: string; serviceDef: ServiceDef }) {
-  const { data: status, refresh } = usePluginData<ConnectionStatus>("connection-status", { serviceId });
-  const { data: connectData, refresh: refreshConnectUrl } = usePluginData<ConnectUrlData>("connect-url", { serviceId, scopes: serviceDef.scopes ?? "" });
+function OAuthSetup({ serviceId, serviceDef, companyId }: { serviceId: string; serviceDef: ServiceDef; companyId: string }) {
+  const { data: status, refresh } = usePluginData<ConnectionStatus>("connection-status", { serviceId, companyId });
+  const { data: connectData, refresh: refreshConnectUrl } = usePluginData<ConnectUrlData>("connect-url", { serviceId, companyId, scopes: serviceDef.scopes ?? "" });
   const saveOAuthConfig = usePluginAction("save-service-oauth-config");
   const disconnectAction = usePluginAction("disconnect-service");
 
   const [clientId, setClientId] = useState("");
   const [clientSecret, setClientSecret] = useState("");
-  const [callbackUrl, setCallbackUrl] = useState("https://cortex.neoreef.com:8443/oauth/callback");
+  const [callbackUrl, setCallbackUrl] = useState("https://cortex.neoreef.com/oauth/callback");
   const [dataCenter, setDataCenter] = useState("US");
   const [configSaved, setConfigSaved] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -211,7 +211,7 @@ function OAuthSetup({ serviceId, serviceDef }: { serviceId: string; serviceDef: 
     if (!clientId) return;
     setSaving(true);
     try {
-      await saveOAuthConfig({ serviceId, clientId, clientSecret, callbackUrl, dataCenter });
+      await saveOAuthConfig({ serviceId, companyId, clientId, clientSecret, callbackUrl, dataCenter });
       setConfigSaved(true);
       setTimeout(() => { refresh(); refreshConnectUrl(); }, 500);
     } catch (e) {
@@ -219,14 +219,14 @@ function OAuthSetup({ serviceId, serviceDef }: { serviceId: string; serviceDef: 
     } finally {
       setSaving(false);
     }
-  }, [serviceId, clientId, clientSecret, callbackUrl, dataCenter, saveOAuthConfig, refresh, refreshConnectUrl]);
+  }, [serviceId, companyId, clientId, clientSecret, callbackUrl, dataCenter, saveOAuthConfig, refresh, refreshConnectUrl]);
 
   const handleDisconnect = useCallback(async () => {
     if (confirm("Disconnect this service? You will need to re-authenticate.")) {
-      await disconnectAction({ serviceId });
+      await disconnectAction({ serviceId, companyId });
       refresh();
     }
-  }, [serviceId, disconnectAction, refresh]);
+  }, [serviceId, companyId, disconnectAction, refresh]);
 
   if (status?.connected) {
     return (
@@ -301,7 +301,7 @@ function OAuthSetup({ serviceId, serviceDef }: { serviceId: string; serviceDef: 
 
 // ─── Deluge Script Templates ────────────────────────────────────────────────
 
-const WEBHOOK_URL = "https://cortex.neoreef.com:8443/cliq";
+const WEBHOOK_URL = "https://cortex.neoreef.com/cliq";
 
 function delugeMessageHandler(botName: string): string {
   return `bot_name = "${botName}";
@@ -552,8 +552,8 @@ function InlineBotSetup({ botName }: { botName: string }) {
 
 // ─── Cliq Config (OAuth + bot mappings with inline setup) ───────────────────
 
-function CliqConfig({ serviceId }: { serviceId: string }) {
-  const { data: status } = usePluginData<ConnectionStatus>("connection-status", { serviceId });
+function CliqConfig({ serviceId, companyId }: { serviceId: string; companyId: string }) {
+  const { data: status } = usePluginData<ConnectionStatus>("connection-status", { serviceId, companyId });
   const serviceDef = AVAILABLE_CHANNELS.find((s) => s.type === "zoho-cliq")!;
 
   const { data: botMappings, refresh: refreshMappings } = usePluginData<BotMapping[]>("bot-mappings");
@@ -618,7 +618,7 @@ function CliqConfig({ serviceId }: { serviceId: string }) {
   return (
     <div>
       {/* OAuth Setup */}
-      <OAuthSetup serviceId={serviceId} serviceDef={serviceDef} />
+      <OAuthSetup serviceId={serviceId} serviceDef={serviceDef} companyId={companyId} />
 
       {/* Bot Mappings (gated on connection) */}
       {status?.connected && (
@@ -693,7 +693,7 @@ function CliqConfig({ serviceId }: { serviceId: string }) {
         </div>
       )}
 
-      {status?.connected && <ServiceNotifySection serviceId={serviceId} companies={companies} />}
+      {status?.connected && <ServiceNotifySection serviceId={serviceId} scopeCompanyId={companyId} companies={companies} />}
     </div>
   );
 }
@@ -720,12 +720,14 @@ type ServiceNotify = { enabled: boolean; mappings: ChannelUserMapping[] };
  * table mapping a Paperclip user to this channel's user. Lives inside the
  * service config so each platform owns its own identity mapping (AC-6).
  */
-function ServiceNotifySection({ serviceId, companies }: { serviceId: string; companies: IdName[] }) {
-  const { data: notify, refresh } = usePluginData<ServiceNotify>("service-notify", { serviceId });
-  const { data: cliqUsersData } = usePluginData<{ users: CliqUser[] }>("cliq-users");
+function ServiceNotifySection({ serviceId, scopeCompanyId, companies }: { serviceId: string; scopeCompanyId: string; companies: IdName[] }) {
+  const { data: notify, refresh } = usePluginData<ServiceNotify>("service-notify", { serviceId, companyId: scopeCompanyId });
+  const { data: cliqUsersData } = usePluginData<{ users: CliqUser[] }>("cliq-users", { serviceId, companyId: scopeCompanyId });
   const save = usePluginAction("save-service-notify");
 
-  const [companyId, setCompanyId] = useState("");
+  // The user-mapping picker defaults to the page's company but can target any.
+  const [companyId, setCompanyId] = useState(scopeCompanyId);
+  useEffect(() => { setCompanyId(scopeCompanyId); }, [scopeCompanyId]);
   const { data: pcUsersData } = usePluginData<{ users: PaperclipUser[] }>(
     "paperclip-users",
     companyId ? { companyId } : undefined,
@@ -761,7 +763,7 @@ function ServiceNotifySection({ serviceId, companies }: { serviceId: string; com
   }));
 
   async function persist(nextEnabled: boolean, nextMappings: ChannelUserMapping[]) {
-    await save({ serviceId, config: { enabled: nextEnabled, mappings: nextMappings } });
+    await save({ serviceId, companyId: scopeCompanyId, config: { enabled: nextEnabled, mappings: nextMappings } });
     refresh();
   }
   async function toggle() { const v = !enabled; setEnabled(v); await persist(v, mappings); }
@@ -872,7 +874,17 @@ function ServiceNotifySection({ serviceId, companies }: { serviceId: string; com
 // ─── Main Settings Page ─────────────────────────────────────────────────────
 
 export function AgentChannelsSettingsPage(_props: PluginSettingsPageProps) {
-  const { data: services, refresh: refreshServices } = usePluginData<ServiceRecord[]>("services");
+  // Company scope (NEO-79) — token storage is namespaced per company, so the
+  // whole page operates within one selected company. Default to the first.
+  const { data: companiesData } = usePluginData<{ companies: IdName[] }>("paperclip-companies");
+  const companies = companiesData?.companies ?? [];
+  const [companyId, setCompanyId] = useState("");
+  useEffect(() => {
+    if (!companyId && companies.length > 0) setCompanyId(companies[0].id);
+  }, [companies, companyId]);
+
+  const servicesParams = companyId ? { companyId } : undefined;
+  const { data: services, refresh: refreshServices } = usePluginData<ServiceRecord[]>("services", servicesParams);
   const addService = usePluginAction("add-service");
   const removeService = usePluginAction("remove-service");
   const [addingService, setAddingService] = useState(false);
@@ -881,34 +893,22 @@ export function AgentChannelsSettingsPage(_props: PluginSettingsPageProps) {
 
   // Per-service connection status for badges
   const serviceList = services ?? [];
-  const [serviceStatuses, setServiceStatuses] = useState<Record<string, ConnectionStatus>>({});
-
-  // Poll connection status for all services
-  useEffect(() => {
-    if (serviceList.length === 0) return;
-    const poll = async () => {
-      // We can't call usePluginData per service in a loop, so we rely on
-      // the individual CliqConfig components to show status. The badge
-      // uses a simplified check.
-    };
-    poll();
-  }, [serviceList]);
 
   const handleAddService = useCallback(async () => {
-    if (!selectedType) return;
+    if (!selectedType || !companyId) return;
     const def = AVAILABLE_CHANNELS.find((s) => s.type === selectedType);
     if (!def) return;
-    await addService({ serviceType: def.type, name: def.name });
+    await addService({ serviceType: def.type, name: def.name, companyId });
     setAddingService(false);
     setSelectedType("");
     refreshServices();
-  }, [selectedType, addService, refreshServices]);
+  }, [selectedType, companyId, addService, refreshServices]);
 
   const handleRemoveService = useCallback(async (serviceId: string) => {
     if (!confirm("Remove this channel and its configuration?")) return;
-    await removeService({ serviceId });
+    await removeService({ serviceId, companyId });
     refreshServices();
-  }, [removeService, refreshServices]);
+  }, [removeService, companyId, refreshServices]);
 
   const configuredTypes = new Set(serviceList.map((s) => s.type));
 
@@ -918,8 +918,23 @@ export function AgentChannelsSettingsPage(_props: PluginSettingsPageProps) {
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "0.75rem" }}>
           <h3 style={{ margin: 0 }}>Messaging Channels</h3>
           {!addingService && (
-            <button type="button" style={btnSmall} onClick={() => setAddingService(true)}>+ Add Channel</button>
+            <button type="button" style={btnSmall} onClick={() => setAddingService(true)} disabled={!companyId}>+ Add Channel</button>
           )}
+        </div>
+
+        <div style={{ ...row, marginBottom: "1rem" }}>
+          <label style={{ fontSize: "12px", flexShrink: 0 }}>Company</label>
+          <select
+            style={{ ...selectStyle, minWidth: 240 }}
+            value={companyId}
+            onChange={(e) => { setCompanyId(e.target.value); setExpandedService(null); }}
+          >
+            {companies.length === 0 && <option value="">Loading companies…</option>}
+            {companies.map((c) => (
+              <option key={c.id} value={c.id}>{c.name}</option>
+            ))}
+          </select>
+          <span style={muted}>Each company connects its own Zoho org independently.</span>
         </div>
 
         {addingService && (
@@ -957,6 +972,7 @@ export function AgentChannelsSettingsPage(_props: PluginSettingsPageProps) {
               key={svc.id}
               svc={svc}
               def={def}
+              companyId={companyId}
               isExpanded={isExpanded}
               onToggleExpand={() => setExpandedService(isExpanded ? null : svc.id)}
               onRemove={() => handleRemoveService(svc.id)}
@@ -970,14 +986,15 @@ export function AgentChannelsSettingsPage(_props: PluginSettingsPageProps) {
 
 // ─── Service Card with inline connection status ─────────────────────────────
 
-function ServiceCard({ svc, def, isExpanded, onToggleExpand, onRemove }: {
+function ServiceCard({ svc, def, companyId, isExpanded, onToggleExpand, onRemove }: {
   svc: ServiceRecord;
   def: ServiceDef | undefined;
+  companyId: string;
   isExpanded: boolean;
   onToggleExpand: () => void;
   onRemove: () => void;
 }) {
-  const { data: status, refresh } = usePluginData<ConnectionStatus>("connection-status", { serviceId: svc.id });
+  const { data: status, refresh } = usePluginData<ConnectionStatus>("connection-status", { serviceId: svc.id, companyId });
   const isConnected = status?.connected ?? false;
   const isLoading = status === undefined || status === null;
 
@@ -1016,7 +1033,7 @@ function ServiceCard({ svc, def, isExpanded, onToggleExpand, onRemove }: {
         def?.status === "coming-soon"
           ? <ComingSoonConfig serviceDef={def} />
           : svc.type === "zoho-cliq"
-            ? <CliqConfig serviceId={svc.id} />
+            ? <CliqConfig serviceId={svc.id} companyId={companyId} />
             : <ComingSoonConfig serviceDef={def ?? { type: svc.type, name: svc.name, description: "Unknown channel", status: "coming-soon", authType: "none" }} />
       )}
     </div>

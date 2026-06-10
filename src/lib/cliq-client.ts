@@ -3,91 +3,89 @@
  * Handles OAuth token refresh, bot message sending, card messages,
  * streaming edits, and rate limiting.
  *
- * Supports per-service auth (bridge.service.{serviceId}.auth/config)
- * with fallback to global zoho.auth for legacy.
+ * Per-company, per-service auth (NEO-79): a `CliqScope` of `{ companyId?,
+ * serviceId? }` flows through the send/refresh paths so a company's bot always
+ * uses that company's own Zoho org. Storage lives in `service-store.ts` under
+ * `scopeKind: "company"`, with legacy `instance`/global fallback when no
+ * companyId is supplied.
  */
 
 import type { PluginContext } from "@paperclipai/plugin-sdk";
 import { DATA_CENTERS, type DataCenterKey } from "../constants.js";
 import type { ZohoAuthState } from "./types.js";
+import {
+  getServiceAuth,
+  getServiceOAuthConfig,
+  saveServiceAuth,
+  findConnectedService,
+} from "./service-store.js";
 import { acquireSlot, recordLockout, recordSlotUsage } from "./rate-limiter.js";
 import { markdownToCliq } from "./format.js";
 
 const TOKEN_SAFETY_MARGIN_MS = 60_000;
 
-// Per-service refresh state to prevent a thundering herd of concurrent refreshes.
-// Many streaming edits can race to refresh an expired token at once; we collapse
-// them into a single in-flight refresh per service, and back off per service if
-// Zoho rate-limits us. Keying by serviceId keeps concurrent multi-service
-// refreshes independent — one service's refresh (or rate-limit backoff) can't
-// clobber another's in a multi-tenant deployment.
+/** Identifies which company/service a Cliq call should authenticate as. */
+export type CliqScope = { companyId?: string; serviceId?: string };
+
+// Per-(company,service) refresh state to prevent a thundering herd of concurrent
+// refreshes. Many streaming edits can race to refresh an expired token at once;
+// we collapse them into a single in-flight refresh per scope, and back off per
+// scope if Zoho rate-limits us. Keying by company+service keeps concurrent
+// multi-tenant refreshes independent — one company's refresh (or rate-limit
+// backoff) can't clobber another's.
 const refreshInFlight = new Map<string, Promise<string>>();
 const refreshBackoffUntil = new Map<string, number>();
 
-// The legacy global-auth path has no serviceId; bucket those calls together.
+// The legacy global-auth path has no companyId/serviceId; bucket those together.
 const GLOBAL_REFRESH_KEY = "__global__";
 
-// ─── Per-service auth ────────────────────────────────────────────────────────
-
-type ServiceOAuthConfig = {
-  clientId: string;
-  clientSecret: string;
-  callbackUrl: string;
-  dataCenter: DataCenterKey;
-};
-
-async function getServiceAuth(ctx: PluginContext, serviceId: string): Promise<ZohoAuthState | null> {
-  return (await ctx.state.get({ scopeKind: "instance", stateKey: `bridge.service.${serviceId}.auth` })) as ZohoAuthState | null;
+function refreshKey(scope: CliqScope): string {
+  if (!scope.companyId && !scope.serviceId) return GLOBAL_REFRESH_KEY;
+  return `${scope.companyId ?? "_"}::${scope.serviceId ?? "_"}`;
 }
 
-async function getServiceConfig(ctx: PluginContext, serviceId: string): Promise<ServiceOAuthConfig | null> {
-  return (await ctx.state.get({ scopeKind: "instance", stateKey: `bridge.service.${serviceId}.config` })) as ServiceOAuthConfig | null;
-}
+// ─── Resolve auth: per-service → company's first connected → global fallback ──
 
-async function saveServiceAuth(ctx: PluginContext, serviceId: string, auth: ZohoAuthState): Promise<void> {
-  await ctx.state.set({ scopeKind: "instance", stateKey: `bridge.service.${serviceId}.auth` }, auth);
-}
-
-// ─── Resolve auth: try per-service first, then global fallback ───────────────
-
-async function resolveAuth(ctx: PluginContext, serviceId?: string): Promise<{ auth: ZohoAuthState; serviceId?: string }> {
-  // Try per-service
+async function resolveAuth(
+  ctx: PluginContext,
+  scope: CliqScope,
+): Promise<{ auth: ZohoAuthState; serviceId?: string; companyId?: string }> {
+  const { companyId, serviceId } = scope;
+  // Try the explicit service first.
   if (serviceId) {
-    const auth = await getServiceAuth(ctx, serviceId);
-    if (auth?.refreshToken) return { auth, serviceId };
+    const auth = await getServiceAuth(ctx, serviceId, companyId);
+    if (auth?.refreshToken) return { auth, serviceId, companyId };
   }
-  // Find first connected Cliq service
-  const services = ((await ctx.state.get({ scopeKind: "instance", stateKey: "channels.services" })) as any[] | null) ?? [];
-  for (const svc of services) {
-    if (svc.type === "zoho-cliq") {
-      const auth = await getServiceAuth(ctx, svc.id);
-      if (auth?.refreshToken) return { auth, serviceId: svc.id };
-    }
+  // Find the company's first connected Cliq service.
+  const found = await findConnectedService(ctx, "zoho-cliq", companyId);
+  if (found) return { auth: found.auth, serviceId: found.serviceId, companyId };
+  // Legacy global fallback (only when not scoped to a company, to keep tenants
+  // isolated — a company never inherits the unscoped global token).
+  if (!companyId) {
+    const global = (await ctx.state.get({ scopeKind: "instance", stateKey: "zoho.auth" })) as ZohoAuthState | null;
+    if (global?.refreshToken) return { auth: global };
   }
-  // Legacy global fallback
-  const global = (await ctx.state.get({ scopeKind: "instance", stateKey: "zoho.auth" })) as ZohoAuthState | null;
-  if (global?.refreshToken) return { auth: global };
   throw new Error("Zoho not connected. Complete OAuth setup in plugin settings.");
 }
 
-async function refreshAccessToken(ctx: PluginContext, serviceId?: string): Promise<string> {
-  const key = serviceId ?? GLOBAL_REFRESH_KEY;
+async function refreshAccessToken(ctx: PluginContext, scope: CliqScope): Promise<string> {
+  const key = refreshKey(scope);
 
-  // Collapse concurrent refreshes for this service into one in-flight request.
+  // Collapse concurrent refreshes for this scope into one in-flight request.
   const inFlight = refreshInFlight.get(key);
   if (inFlight) return inFlight;
 
-  // Respect Zoho rate-limit backoff (tracked per service).
+  // Respect Zoho rate-limit backoff (tracked per scope).
   if (Date.now() < (refreshBackoffUntil.get(key) ?? 0)) {
     // Return the (possibly stale) cached token rather than hammering Zoho.
-    const { auth } = await resolveAuth(ctx, serviceId);
+    const { auth } = await resolveAuth(ctx, scope);
     if (auth.accessToken) return auth.accessToken;
     throw new Error("Token refresh backing off after Zoho rate limit");
   }
 
-  const refresh = doRefreshAccessToken(ctx, serviceId)
+  const refresh = doRefreshAccessToken(ctx, scope)
     .catch((err) => {
-      // On "too many requests", back off this service for 10 minutes.
+      // On "too many requests", back off this scope for 10 minutes.
       if (String(err).includes("too many requests") || String(err).includes("Access Denied")) {
         refreshBackoffUntil.set(key, Date.now() + 10 * 60_000);
         ctx.logger.error("Zoho refresh rate-limited — backing off 10 min");
@@ -101,15 +99,15 @@ async function refreshAccessToken(ctx: PluginContext, serviceId?: string): Promi
   return refresh;
 }
 
-async function doRefreshAccessToken(ctx: PluginContext, serviceId?: string): Promise<string> {
-  const { auth, serviceId: resolvedServiceId } = await resolveAuth(ctx, serviceId);
+async function doRefreshAccessToken(ctx: PluginContext, scope: CliqScope): Promise<string> {
+  const { auth, serviceId: resolvedServiceId, companyId: resolvedCompanyId } = await resolveAuth(ctx, scope);
 
   // Get credentials from per-service config or plugin config
   let clientId: string | undefined;
   let clientSecret: string | undefined;
 
   if (resolvedServiceId) {
-    const svcConfig = await getServiceConfig(ctx, resolvedServiceId);
+    const svcConfig = await getServiceOAuthConfig(ctx, resolvedServiceId, resolvedCompanyId);
     clientId = svcConfig?.clientId;
     clientSecret = svcConfig?.clientSecret;
   }
@@ -154,20 +152,20 @@ async function doRefreshAccessToken(ctx: PluginContext, serviceId?: string): Pro
   };
 
   if (resolvedServiceId) {
-    await saveServiceAuth(ctx, resolvedServiceId, updated);
+    await saveServiceAuth(ctx, resolvedServiceId, updated, resolvedCompanyId);
   } else {
     await ctx.state.set({ scopeKind: "instance", stateKey: "zoho.auth" }, updated);
   }
   return data.access_token;
 }
 
-async function getAccessToken(ctx: PluginContext, serviceId?: string): Promise<{ token: string; dataCenter: DataCenterKey }> {
-  const { auth } = await resolveAuth(ctx, serviceId);
+async function getAccessToken(ctx: PluginContext, scope: CliqScope): Promise<{ token: string; dataCenter: DataCenterKey }> {
+  const { auth } = await resolveAuth(ctx, scope);
   if (auth.accessToken && auth.expiresAt && Date.now() < auth.expiresAt) {
     return { token: auth.accessToken, dataCenter: auth.dataCenter };
   }
-  const token = await refreshAccessToken(ctx, serviceId);
-  const refreshed = await resolveAuth(ctx, serviceId);
+  const token = await refreshAccessToken(ctx, scope);
+  const refreshed = await resolveAuth(ctx, scope);
   return { token, dataCenter: refreshed.auth.dataCenter };
 }
 
@@ -178,7 +176,7 @@ async function cliqFetch(
   method: string,
   url: string,
   body: unknown | undefined,
-  opts?: { maxWaitMs?: number; skipRateLimit?: boolean; serviceId?: string },
+  opts?: { maxWaitMs?: number; skipRateLimit?: boolean; serviceId?: string; companyId?: string },
 ): Promise<{ status: number; data: unknown }> {
   if (opts?.skipRateLimit) {
     recordSlotUsage();
@@ -189,7 +187,8 @@ async function cliqFetch(
     }
   }
 
-  const { token, dataCenter } = await getAccessToken(ctx, opts?.serviceId);
+  const scope: CliqScope = { companyId: opts?.companyId, serviceId: opts?.serviceId };
+  const { token, dataCenter } = await getAccessToken(ctx, scope);
   const center = DATA_CENTERS[dataCenter] ?? DATA_CENTERS.US;
   const fullUrl = url.startsWith("https://") ? url : `https://${center.cliq}/api/v2${url}`;
 
@@ -226,7 +225,7 @@ async function cliqFetch(
   }
 
   if (res.status === 401) {
-    const newToken = await refreshAccessToken(ctx, opts?.serviceId);
+    const newToken = await refreshAccessToken(ctx, scope);
     headers.Authorization = `Zoho-oauthtoken ${newToken}`;
     res = await httpFetch({ ...init, headers });
     if (res.status === 429) recordLockout(10 * 60_000);
@@ -316,9 +315,9 @@ function extractBotDmMessageRef(data: unknown, userId: string): CliqMessageRef {
  * works), authenticated with the OAuth token (needs ZohoCliq.Attachments.READ).
  * Returns the raw bytes, or null on failure.
  */
-export async function downloadCliqFile(ctx: PluginContext, url: string): Promise<Buffer | null> {
+export async function downloadCliqFile(ctx: PluginContext, url: string, scope: CliqScope = {}): Promise<Buffer | null> {
   try {
-    const { token } = await getAccessToken(ctx);
+    const { token } = await getAccessToken(ctx, scope);
     const res = await ctx.http.fetch(url, {
       method: "GET",
       headers: { Authorization: `Zoho-oauthtoken ${token}` },
@@ -344,6 +343,7 @@ export async function sendCliqMessage(
   userId: string,
   text: string,
   buttons?: CliqButton[],
+  scope: CliqScope = {},
 ): Promise<{ ref: CliqMessageRef }> {
   const body: Record<string, unknown> = {
     text: markdownToCliq(text),
@@ -352,7 +352,7 @@ export async function sendCliqMessage(
   };
   if (buttons && buttons.length > 0) body.buttons = buttons;
 
-  const result = await cliqFetch(ctx, "POST", `/bots/${encodeURIComponent(botName)}/message`, body);
+  const result = await cliqFetch(ctx, "POST", `/bots/${encodeURIComponent(botName)}/message`, body, scope);
   if (!result.status || result.status >= 400) {
     ctx.logger.error(`Cliq send failed (${result.status}): ${JSON.stringify(result.data).slice(0, 200)}`);
   }
@@ -372,6 +372,8 @@ export async function sendCliqCardMessage(
     slides?: Array<{ type: string; title?: string; data: any }>;
     bot?: { name: string; image?: string };
     buttons?: CliqButton[];
+    companyId?: string;
+    serviceId?: string;
   },
 ): Promise<{ status: number; ref: CliqMessageRef }> {
   const body: Record<string, unknown> = {
@@ -384,7 +386,10 @@ export async function sendCliqCardMessage(
   if (opts?.bot) body.bot = opts.bot;
   if (opts?.buttons && opts.buttons.length > 0) body.buttons = opts.buttons;
 
-  const result = await cliqFetch(ctx, "POST", `/bots/${encodeURIComponent(botName)}/message`, body);
+  const result = await cliqFetch(ctx, "POST", `/bots/${encodeURIComponent(botName)}/message`, body, {
+    companyId: opts?.companyId,
+    serviceId: opts?.serviceId,
+  });
   return { status: result.status, ref: extractBotDmMessageRef(result.data, userId) };
 }
 
@@ -399,12 +404,15 @@ export async function sendCliqChatMessage(
   ctx: PluginContext,
   chatId: string,
   text: string,
-  opts?: { buttons?: CliqButton[] },
+  opts?: { buttons?: CliqButton[]; companyId?: string; serviceId?: string },
 ): Promise<{ status: number; ref: CliqMessageRef }> {
   const body: Record<string, unknown> = { text: markdownToCliq(text), sync_message: true };
   if (opts?.buttons && opts.buttons.length > 0) body.buttons = opts.buttons;
 
-  const result = await cliqFetch(ctx, "POST", `/chats/${encodeURIComponent(chatId)}/message`, body);
+  const result = await cliqFetch(ctx, "POST", `/chats/${encodeURIComponent(chatId)}/message`, body, {
+    companyId: opts?.companyId,
+    serviceId: opts?.serviceId,
+  });
   const messageId = extractBotDmMessageRef(result.data, "").messageId;
   return { status: result.status, ref: { chatId, messageId } };
 }
@@ -422,6 +430,8 @@ export async function editCliqMessage(
     bot?: { name: string; image?: string };
     buttons?: CliqButton[];
     skipRateLimit?: boolean;
+    companyId?: string;
+    serviceId?: string;
   },
 ): Promise<{ status: number; data: unknown }> {
   const formattedText = opts?.card ? text : markdownToCliq(text);
@@ -436,7 +446,7 @@ export async function editCliqMessage(
     "PUT",
     `/chats/${encodeURIComponent(chatId)}/messages/${encodeURIComponent(messageId)}`,
     body,
-    { skipRateLimit: opts?.skipRateLimit },
+    { skipRateLimit: opts?.skipRateLimit, companyId: opts?.companyId, serviceId: opts?.serviceId },
   );
 }
 
@@ -446,12 +456,14 @@ export async function deleteCliqMessage(
   ctx: PluginContext,
   chatId: string,
   messageId: string,
+  scope: CliqScope = {},
 ): Promise<void> {
   await cliqFetch(
     ctx,
     "DELETE",
     `/chats/${encodeURIComponent(chatId)}/messages/${encodeURIComponent(messageId)}`,
     undefined,
+    scope,
   );
 }
 
@@ -489,7 +501,7 @@ function toCliqUser(u: Record<string, unknown>): CliqUser | null {
  * Requires the ZohoCliq.Users.READ / ZohoCliq.Organisation.READ scope — a
  * connection consented before those were added returns 401/"not authorised".
  */
-export async function listCliqUsers(ctx: PluginContext, serviceId?: string): Promise<CliqUser[]> {
+export async function listCliqUsers(ctx: PluginContext, scope: CliqScope = {}): Promise<CliqUser[]> {
   const out: CliqUser[] = [];
   const seen = new Set<string>();
   let nextToken: string | undefined;
@@ -498,7 +510,8 @@ export async function listCliqUsers(ctx: PluginContext, serviceId?: string): Pro
     const params = new URLSearchParams({ fields: "display_name", limit: "100" });
     if (nextToken) params.set("next_token", nextToken);
     const { status, data } = await cliqFetch(ctx, "GET", `/users?${params.toString()}`, undefined, {
-      serviceId,
+      companyId: scope.companyId,
+      serviceId: scope.serviceId,
     });
     if (status < 200 || status >= 300) {
       ctx.logger.info(`listCliqUsers: HTTP ${status}${page > 0 ? ` (after ${out.length} users)` : ""}`);
@@ -532,24 +545,29 @@ export async function sendCliqMessageChunked(
   userId: string,
   text: string,
   buttons?: CliqButton[],
+  scope: CliqScope = {},
 ): Promise<void> {
   const { chunkText } = await import("./format.js");
   const chunks = chunkText(text);
   for (let i = 0; i < chunks.length; i++) {
     const isLast = i === chunks.length - 1;
-    await sendCliqMessage(ctx, botName, userId, chunks[i], isLast ? buttons : undefined);
+    await sendCliqMessage(ctx, botName, userId, chunks[i], isLast ? buttons : undefined, scope);
   }
 }
 
-// ─── Proactive token refresh (per-service) ───────────────────────────────────
+// ─── Proactive token refresh (per-company, per-service) ──────────────────────
 
-export async function proactiveServiceTokenRefresh(ctx: PluginContext, serviceId: string): Promise<void> {
+export async function proactiveServiceTokenRefresh(
+  ctx: PluginContext,
+  serviceId: string,
+  companyId?: string,
+): Promise<void> {
   try {
-    const auth = await getServiceAuth(ctx, serviceId);
+    const auth = await getServiceAuth(ctx, serviceId, companyId);
     if (!auth?.refreshToken) return;
     const timeUntilExpiry = auth.expiresAt - Date.now();
     if (timeUntilExpiry < 15 * 60_000) {
-      await refreshAccessToken(ctx, serviceId);
+      await refreshAccessToken(ctx, { companyId, serviceId });
     }
   } catch {
     // No auth configured — skip
@@ -559,10 +577,10 @@ export async function proactiveServiceTokenRefresh(ctx: PluginContext, serviceId
 /** @deprecated Use proactiveServiceTokenRefresh */
 export async function proactiveTokenRefresh(ctx: PluginContext): Promise<void> {
   try {
-    const { auth } = await resolveAuth(ctx);
+    const { auth } = await resolveAuth(ctx, {});
     const timeUntilExpiry = auth.expiresAt - Date.now();
     if (timeUntilExpiry < 15 * 60_000) {
-      await refreshAccessToken(ctx);
+      await refreshAccessToken(ctx, {});
     }
   } catch {
     // No auth configured — skip

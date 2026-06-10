@@ -55,8 +55,8 @@ export async function dispatchNotification(
   if (targets.length === 0) return 0;
 
   let delivered = 0;
-  for (const svc of await listServices(ctx)) {
-    const notify = await getServiceNotify(ctx, svc.id);
+  for (const svc of await listServices(ctx, companyId)) {
+    const notify = await getServiceNotify(ctx, svc.id, companyId);
     if (!notify.enabled) continue;
 
     if (svc.type === "zoho-cliq") {
@@ -69,7 +69,7 @@ export async function dispatchNotification(
         const channelUserId = channelUserFor(notify, pid);
         if (!channelUserId) continue;
         try {
-          await sendCliqMessage(ctx, bot, channelUserId, text, buttons);
+          await sendCliqMessage(ctx, bot, channelUserId, text, buttons, { companyId, serviceId: svc.id });
           delivered++;
         } catch (err) {
           ctx.logger.error(`notify: cliq send to ${channelUserId} failed: ${String(err)}`);
