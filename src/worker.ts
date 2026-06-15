@@ -344,7 +344,7 @@ const plugin: PaperclipPlugin = definePlugin({
       const serviceType = params.serviceType as string;
       const companyId = params.companyId as string | undefined;
       const services = await listServices(ctx, companyId);
-      const serviceId = `${serviceType}-${Date.now()}`;
+      const serviceId = `${serviceType}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
       services.push({
         id: serviceId,
         type: serviceType,
