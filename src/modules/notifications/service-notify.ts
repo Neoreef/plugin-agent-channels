@@ -8,7 +8,7 @@
  */
 
 import type { PluginContext } from "@paperclipai/plugin-sdk";
-import { listServices as listStoredServices } from "../../lib/service-store.js";
+import { listServices as listStoredServices, serviceStore } from "../../lib/service-store.js";
 
 export type ChannelUserMapping = {
   /** Paperclip principalId (principalType === "user"). */
@@ -26,13 +26,12 @@ export type ServiceNotifyConfig = {
   mappings: ChannelUserMapping[];
 };
 
-const notifyKey = (serviceId: string) => `bridge.service.${serviceId}.notify`;
-
-function notifyScope(companyId: string | undefined, serviceId: string) {
-  return companyId
-    ? ({ scopeKind: "company", scopeId: companyId, stateKey: notifyKey(serviceId) } as const)
-    : ({ scopeKind: "instance", stateKey: notifyKey(serviceId) } as const);
-}
+/**
+ * The notify mapping is just another per-connection slot (`bridge.service.<id>.notify`),
+ * so it rides the shared connection store's slot API — same company scoping and
+ * legacy instance-scope fallback as auth/config, no duplicated logic (NEO-120).
+ */
+const NOTIFY_SLOT = "notify";
 
 export type ServiceRecord = { id: string; type: string; name?: string; enabled?: boolean };
 
@@ -42,11 +41,8 @@ export async function listServices(ctx: PluginContext, companyId?: string): Prom
 }
 
 export async function getServiceNotify(ctx: PluginContext, serviceId: string, companyId?: string): Promise<ServiceNotifyConfig> {
-  let v = (await ctx.state.get(notifyScope(companyId, serviceId))) as ServiceNotifyConfig | null;
-  // Legacy bridge: fall back to instance scope for a not-yet-migrated tenant.
-  if (v == null && companyId) {
-    v = (await ctx.state.get(notifyScope(undefined, serviceId))) as ServiceNotifyConfig | null;
-  }
+  // Company scope with legacy instance-scope fallback, handled by the shared store.
+  const v = await serviceStore.getSlot<ServiceNotifyConfig>(ctx, serviceId, NOTIFY_SLOT, companyId);
   return v ?? { enabled: false, mappings: [] };
 }
 
@@ -56,7 +52,7 @@ export async function saveServiceNotify(
   cfg: ServiceNotifyConfig,
   companyId?: string,
 ): Promise<void> {
-  await ctx.state.set(notifyScope(companyId, serviceId), cfg);
+  await serviceStore.setSlot<ServiceNotifyConfig>(ctx, serviceId, NOTIFY_SLOT, cfg, companyId);
 }
 
 export function channelUserFor(cfg: ServiceNotifyConfig, paperclipUserId: string): string | null {

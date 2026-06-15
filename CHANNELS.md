@@ -26,7 +26,11 @@ Every channel implements [`ChannelModule`](src/lib/types.ts):
 Token storage is namespaced **per company** so multiple companies can each connect
 their own Zoho org without interfering (NEO-79). All service registry, auth, and
 config reads/writes go through [`src/lib/service-store.ts`](src/lib/service-store.ts),
-which partitions state by `{ scopeKind: "company", scopeId: companyId }`:
+which is now a thin binding over the **shared per-company connection store**
+[`src/lib/connections/`](src/lib/connections/) (extracted in NEO-120 so Project
+Bridge and Knowledge Bridge share the identical contract — see
+[CONNECTIONS.md](CONNECTIONS.md)). It partitions state by
+`{ scopeKind: "company", scopeId: companyId }`:
 
 | State | Key | Scope |
 | --- | --- | --- |

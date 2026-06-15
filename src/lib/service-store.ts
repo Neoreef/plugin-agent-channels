@@ -1,30 +1,25 @@
 /**
- * Per-company service storage (NEO-79 — multitenancy).
+ * Per-company service storage (NEO-79 multitenancy → NEO-120 extraction).
  *
- * Token storage is namespaced by company so multiple companies can each connect
- * their own Zoho org without interfering. The SDK exposes `scopeKind: "company"`,
- * so we partition `channels.services` and each service's `.auth` / `.config`
- * under `{ scopeKind: "company", scopeId: companyId }`.
+ * This is now the **reference consumer** of the shared connection store
+ * (`src/lib/connections/`). The generic scope-keyed, legacy-fallback storage
+ * logic lives there; this file is the thin Agent-Channels binding that fixes the
+ * concrete types (`ZohoAuthState`, `ServiceOAuthConfig`) and preserves the exact
+ * public function surface the rest of the plugin already imports — so worker.ts,
+ * cliq-client.ts, the notify module, and the isolation suite are untouched.
  *
- * Backward compatibility: callers that pass no `companyId` (legacy global paths,
- * health checks) read/write the original `scopeKind: "instance"` keys. When a
- * `companyId` is given but that company has no company-scoped value yet, reads
- * fall back to the legacy instance value so a pre-existing single-tenant
- * deployment keeps working until it reconnects (writes always go to company
- * scope). See CHANNELS.md.
+ * Storage layout is byte-for-byte identical to NEO-79 (same state keys, same
+ * `{ scopeKind: "company", scopeId: companyId }` partitioning, same legacy
+ * instance-scope fallback). See CHANNELS.md.
  */
 
 import type { PluginContext } from "@paperclipai/plugin-sdk";
 import type { ZohoAuthState } from "./types.js";
 import type { DataCenterKey } from "../constants.js";
+import { createConnectionStore, type ConnectionRecord } from "./connections/index.js";
 
-export type ServiceRecord = {
-  id: string;
-  type: string;
-  name?: string;
-  enabled?: boolean;
-  createdAt?: string;
-};
+/** A connected channel service (Cliq, Mail, …). */
+export type ServiceRecord = ConnectionRecord;
 
 export type ServiceOAuthConfig = {
   clientId: string;
@@ -33,76 +28,54 @@ export type ServiceOAuthConfig = {
   dataCenter: DataCenterKey;
 };
 
-const SERVICES_KEY = "channels.services";
-const authKey = (serviceId: string): string => `bridge.service.${serviceId}.auth`;
-const configKey = (serviceId: string): string => `bridge.service.${serviceId}.config`;
-
 /**
- * Build a ScopeKey: company-partitioned when `companyId` is present, else the
- * legacy instance-global scope.
+ * The Agent Channels connection store. Defaults reproduce the historical NEO-79
+ * layout: registry at `channels.services`, slots under `bridge.service.<id>.*`.
+ * Exported so sibling modules (e.g. notifications) reuse the same instance and
+ * its arbitrary-slot API instead of re-deriving the scope/fallback logic.
  */
-function scopeKey(companyId: string | undefined, stateKey: string) {
-  return companyId
-    ? ({ scopeKind: "company", scopeId: companyId, stateKey } as const)
-    : ({ scopeKind: "instance", stateKey } as const);
-}
-
-/**
- * Read a value at the company scope, falling back to the legacy instance scope
- * when company-scoped state is absent. Only bridges legacy data; once a company
- * writes its own value the fallback no longer fires.
- */
-async function getScoped<T>(ctx: PluginContext, companyId: string | undefined, stateKey: string): Promise<T | null> {
-  if (companyId) {
-    const v = (await ctx.state.get(scopeKey(companyId, stateKey))) as T | null;
-    if (v != null) return v;
-    // Legacy bridge: read instance-scoped value for a not-yet-migrated tenant.
-    return (await ctx.state.get(scopeKey(undefined, stateKey))) as T | null;
-  }
-  return (await ctx.state.get(scopeKey(undefined, stateKey))) as T | null;
-}
+export const serviceStore = createConnectionStore<ZohoAuthState, ServiceOAuthConfig, ServiceRecord>();
 
 // ─── Service registry ────────────────────────────────────────────────────────
 
-export async function listServices(ctx: PluginContext, companyId?: string): Promise<ServiceRecord[]> {
-  return (await getScoped<ServiceRecord[]>(ctx, companyId, SERVICES_KEY)) ?? [];
+export function listServices(ctx: PluginContext, companyId?: string): Promise<ServiceRecord[]> {
+  return serviceStore.list(ctx, companyId);
 }
 
-export async function saveServices(ctx: PluginContext, services: ServiceRecord[], companyId?: string): Promise<void> {
-  await ctx.state.set(scopeKey(companyId, SERVICES_KEY), services);
+export function saveServices(ctx: PluginContext, services: ServiceRecord[], companyId?: string): Promise<void> {
+  return serviceStore.save(ctx, services, companyId);
 }
 
-export async function getServiceType(ctx: PluginContext, serviceId: string, companyId?: string): Promise<string | undefined> {
-  const services = await listServices(ctx, companyId);
-  return services.find((s) => s.id === serviceId)?.type;
+export function getServiceType(ctx: PluginContext, serviceId: string, companyId?: string): Promise<string | undefined> {
+  return serviceStore.getType(ctx, serviceId, companyId);
 }
 
 // ─── Per-service auth ────────────────────────────────────────────────────────
 
-export async function getServiceAuth(ctx: PluginContext, serviceId: string, companyId?: string): Promise<ZohoAuthState | null> {
-  return await getScoped<ZohoAuthState>(ctx, companyId, authKey(serviceId));
+export function getServiceAuth(ctx: PluginContext, serviceId: string, companyId?: string): Promise<ZohoAuthState | null> {
+  return serviceStore.getAuth(ctx, serviceId, companyId);
 }
 
-export async function saveServiceAuth(ctx: PluginContext, serviceId: string, auth: ZohoAuthState, companyId?: string): Promise<void> {
-  await ctx.state.set(scopeKey(companyId, authKey(serviceId)), auth);
+export function saveServiceAuth(ctx: PluginContext, serviceId: string, auth: ZohoAuthState, companyId?: string): Promise<void> {
+  return serviceStore.setAuth(ctx, serviceId, auth, companyId);
 }
 
-export async function deleteServiceAuth(ctx: PluginContext, serviceId: string, companyId?: string): Promise<void> {
-  await ctx.state.delete(scopeKey(companyId, authKey(serviceId)));
+export function deleteServiceAuth(ctx: PluginContext, serviceId: string, companyId?: string): Promise<void> {
+  return serviceStore.deleteAuth(ctx, serviceId, companyId);
 }
 
 // ─── Per-service OAuth config ────────────────────────────────────────────────
 
-export async function getServiceOAuthConfig(ctx: PluginContext, serviceId: string, companyId?: string): Promise<ServiceOAuthConfig | null> {
-  return await getScoped<ServiceOAuthConfig>(ctx, companyId, configKey(serviceId));
+export function getServiceOAuthConfig(ctx: PluginContext, serviceId: string, companyId?: string): Promise<ServiceOAuthConfig | null> {
+  return serviceStore.getConfig(ctx, serviceId, companyId);
 }
 
-export async function saveServiceOAuthConfig(ctx: PluginContext, serviceId: string, config: ServiceOAuthConfig, companyId?: string): Promise<void> {
-  await ctx.state.set(scopeKey(companyId, configKey(serviceId)), config);
+export function saveServiceOAuthConfig(ctx: PluginContext, serviceId: string, config: ServiceOAuthConfig, companyId?: string): Promise<void> {
+  return serviceStore.setConfig(ctx, serviceId, config, companyId);
 }
 
-export async function deleteServiceOAuthConfig(ctx: PluginContext, serviceId: string, companyId?: string): Promise<void> {
-  await ctx.state.delete(scopeKey(companyId, configKey(serviceId)));
+export function deleteServiceOAuthConfig(ctx: PluginContext, serviceId: string, companyId?: string): Promise<void> {
+  return serviceStore.deleteConfig(ctx, serviceId, companyId);
 }
 
 // ─── Resolution helpers ──────────────────────────────────────────────────────
@@ -116,10 +89,6 @@ export async function findConnectedService(
   type: string,
   companyId?: string,
 ): Promise<{ serviceId: string; auth: ZohoAuthState } | null> {
-  for (const svc of await listServices(ctx, companyId)) {
-    if (svc.type !== type) continue;
-    const auth = await getServiceAuth(ctx, svc.id, companyId);
-    if (auth?.refreshToken) return { serviceId: svc.id, auth };
-  }
-  return null;
+  const found = await serviceStore.findConnected(ctx, type, (auth) => Boolean(auth.refreshToken), companyId);
+  return found ? { serviceId: found.id, auth: found.auth } : null;
 }
