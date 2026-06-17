@@ -552,12 +552,30 @@ function InlineBotSetup({ botName }: { botName: string }) {
 
 // ─── Cliq Config (OAuth + bot mappings with inline setup) ───────────────────
 
+/**
+ * Default Cliq bot unique name for an agent — `<slug>_bot` (e.g. "David O." →
+ * "david_o_bot"), matching the `jarvis_bot` convention shown in the add form.
+ * Used by the bulk "Add all agents" action; bot names stay editable inline so
+ * they can be corrected to match the real bots in the Zoho Cliq console.
+ */
+function defaultBotName(agentName: string): string {
+  const slug = agentName.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
+  return `${slug || "agent"}_bot`;
+}
+
 function CliqConfig({ serviceId, companyId }: { serviceId: string; companyId: string }) {
   const { data: status } = usePluginData<ConnectionStatus>("connection-status", { serviceId, companyId });
   const serviceDef = AVAILABLE_CHANNELS.find((s) => s.type === "zoho-cliq")!;
 
   const { data: botMappings, refresh: refreshMappings } = usePluginData<BotMapping[]>("bot-mappings");
   const { data: companiesData } = usePluginData<{ companies: IdName[] }>("paperclip-companies");
+  // All agents for the page's company — used to resolve agent names in the list
+  // and to power the bulk "Add all agents" action.
+  const { data: pageAgentsData } = usePluginData<{ agents: IdName[] }>(
+    "paperclip-agents",
+    companyId ? { companyId } : undefined,
+  );
+  const pageAgents = pageAgentsData?.agents ?? [];
   const saveMappingsAction = usePluginAction("save-bot-mappings");
 
   const [localMappings, setLocalMappings] = useState<BotMapping[]>([]);
@@ -591,6 +609,48 @@ function CliqConfig({ serviceId, companyId }: { serviceId: string; companyId: st
     setDirty(false);
     refreshMappings();
   }, [newBot, newAgent, newCompany, localMappings, saveMappingsAction, refreshMappings]);
+
+  // Bulk-add every agent in the page's company that isn't already mapped,
+  // leaving existing mappings untouched ("alongside the ones I already have").
+  // Each new row gets a derived `<slug>_bot` name (editable inline afterward).
+  const handleAddAllAgents = useCallback(async () => {
+    if (!companyId || pageAgents.length === 0) return;
+    const mappedAgentIds = new Set(
+      localMappings.filter((m) => m.companyId === companyId).map((m) => m.agentId),
+    );
+    const usedBotNames = new Set(localMappings.map((m) => m.botUniqueName));
+    const additions: BotMapping[] = [];
+    for (const agent of pageAgents) {
+      if (mappedAgentIds.has(agent.id)) continue;
+      let bot = defaultBotName(agent.name);
+      while (usedBotNames.has(bot)) bot = `${bot}_2`;
+      usedBotNames.add(bot);
+      additions.push({ botUniqueName: bot, agentId: agent.id, companyId, enabled: true });
+    }
+    if (additions.length === 0) return;
+    const updated = [...localMappings, ...additions];
+    setLocalMappings(updated);
+    setDirty(true);
+    await saveMappingsAction({ mappings: updated });
+    setDirty(false);
+    refreshMappings();
+  }, [companyId, pageAgents, localMappings, saveMappingsAction, refreshMappings]);
+
+  // Rename a bot's unique name in place (so generated names can be corrected to
+  // match the real bot in the Zoho Cliq console). No-op on empty/collision.
+  const handleRenameBot = useCallback(async (oldName: string, newName: string) => {
+    const trimmed = newName.trim();
+    if (!trimmed || trimmed === oldName) return;
+    if (localMappings.some((m) => m.botUniqueName === trimmed)) return;
+    const updated = localMappings.map((m) =>
+      m.botUniqueName === oldName ? { ...m, botUniqueName: trimmed } : m,
+    );
+    setLocalMappings(updated);
+    setDirty(true);
+    await saveMappingsAction({ mappings: updated });
+    setDirty(false);
+    refreshMappings();
+  }, [localMappings, saveMappingsAction, refreshMappings]);
 
   const handleRemoveMapping = useCallback(async (botName: string) => {
     const updated = localMappings.filter((m) => m.botUniqueName !== botName);
@@ -626,28 +686,49 @@ function CliqConfig({ serviceId, companyId }: { serviceId: string; companyId: st
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "0.5rem" }}>
             <h4 style={{ margin: 0 }}>Bot → Agent Mappings</h4>
             {!adding && (
-              <button type="button" style={btnSmall} onClick={() => setAdding(true)}>+ Add</button>
+              <div style={{ display: "flex", gap: "0.5rem" }}>
+                <button
+                  type="button"
+                  style={btnSmall}
+                  onClick={handleAddAllAgents}
+                  disabled={pageAgents.length === 0}
+                  title="Map every agent in this company that isn't already mapped"
+                >
+                  + Add all agents
+                </button>
+                <button type="button" style={btnSmall} onClick={() => setAdding(true)}>+ Add</button>
+              </div>
             )}
           </div>
-          <p style={muted}>Map each Cliq bot to a Paperclip agent. When a user DMs the bot, the message routes to that agent.</p>
+          <p style={muted}>
+            Map each Cliq bot to a Paperclip agent. When a user DMs the bot, the message routes to that agent.
+            Use <strong>Add all agents</strong> to map every unmapped agent at once — each gets a default
+            <code> &lt;name&gt;_bot</code> name you can edit to match the bot in your Zoho Cliq console.
+          </p>
 
-          {localMappings.map((m) => (
-            <div key={m.botUniqueName} style={{ ...row, padding: "4px 0" }}>
-              <span style={{ flex: 1, fontSize: "13px", opacity: m.enabled ? 1 : 0.5 }}>
-                <strong>{m.botUniqueName}</strong>
-              </span>
-              <span style={muted}>→</span>
-              <span style={{ flex: 1, fontSize: "13px", opacity: m.enabled ? 1 : 0.5 }}>
-                {m.agentId.slice(0, 12)}...
-              </span>
-              <button type="button" style={btnSmall} onClick={() => handleToggle(m.botUniqueName)}>
-                {m.enabled ? "Disable" : "Enable"}
-              </button>
-              <button type="button" style={btnSmallDanger} onClick={() => handleRemoveMapping(m.botUniqueName)}>
-                x
-              </button>
-            </div>
-          ))}
+          {localMappings.map((m) => {
+            const agentName = pageAgents.find((a) => a.id === m.agentId)?.name;
+            return (
+              <div key={m.botUniqueName} style={{ ...row, padding: "4px 0" }}>
+                <input
+                  style={{ ...inputStyle, flex: 1, opacity: m.enabled ? 1 : 0.5 }}
+                  defaultValue={m.botUniqueName}
+                  title="Cliq bot unique name — must match the bot in your Zoho Cliq console"
+                  onBlur={(e) => handleRenameBot(m.botUniqueName, e.target.value)}
+                />
+                <span style={muted}>→</span>
+                <span style={{ flex: 1, fontSize: "13px", opacity: m.enabled ? 1 : 0.5 }}>
+                  {agentName ?? `${m.agentId.slice(0, 12)}...`}
+                </span>
+                <button type="button" style={btnSmall} onClick={() => handleToggle(m.botUniqueName)}>
+                  {m.enabled ? "Disable" : "Enable"}
+                </button>
+                <button type="button" style={btnSmallDanger} onClick={() => handleRemoveMapping(m.botUniqueName)}>
+                  x
+                </button>
+              </div>
+            );
+          })}
 
           {adding && (
             <div style={{ ...cardStyle, padding: "0.75rem 1rem" }}>
