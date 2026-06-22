@@ -35,6 +35,8 @@ export interface DraftStreamParams {
   companyId?: string;
   /** Specific channel service to authenticate as (optional). */
   serviceId?: string;
+  /** Target chat ID if known. */
+  chatId?: string;
 }
 
 export type CliqDraftStream = {
@@ -224,8 +226,15 @@ export function createCliqDraftStream(params: DraftStreamParams): CliqDraftStrea
         slides: payload.slides as any,
         bot: payload.bot as any,
         buttons: payload.buttons as any,
+        chatId: params.chatId,
         ...scope,
       });
+
+      if (result.status >= 400) {
+        ctx.logger.error(`draft-stream send failed with status ${result.status}: ${JSON.stringify(result)}`);
+        return false;
+      }
+
       didSend = true;
 
       if (result.ref.chatId && result.ref.messageId) {
@@ -369,7 +378,15 @@ export function createCliqDraftStream(params: DraftStreamParams): CliqDraftStrea
       pendingText = null;
       inFlight = true;
       try {
-        await sendOrEditWithChunking(text);
+        let attempts = 0;
+        let success = false;
+        while (!success && attempts < 3) {
+          success = await sendOrEditWithChunking(text);
+          if (!success) {
+            attempts++;
+            if (attempts < 3) await sleep(1000);
+          }
+        }
       } finally {
         inFlight = false;
       }
@@ -392,7 +409,15 @@ export function createCliqDraftStream(params: DraftStreamParams): CliqDraftStrea
     pendingText = null;
     inFlight = true;
     try {
-      await sendOrEditWithChunking(textToRender);
+      let attempts = 0;
+      let success = false;
+      while (!success && attempts < 3) {
+        success = await sendOrEditWithChunking(textToRender);
+        if (!success) {
+          attempts++;
+          if (attempts < 3) await sleep(1000);
+        }
+      }
     } finally {
       inFlight = false;
     }

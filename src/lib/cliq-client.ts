@@ -374,11 +374,11 @@ export async function sendCliqCardMessage(
     buttons?: CliqButton[];
     companyId?: string;
     serviceId?: string;
+    chatId?: string;
   },
 ): Promise<{ status: number; ref: CliqMessageRef }> {
   const body: Record<string, unknown> = {
     text,
-    userids: userId,
     card,
     sync_message: true,
   };
@@ -386,7 +386,15 @@ export async function sendCliqCardMessage(
   if (opts?.bot) body.bot = opts.bot;
   if (opts?.buttons && opts.buttons.length > 0) body.buttons = opts.buttons;
 
-  const result = await cliqFetch(ctx, "POST", `/bots/${encodeURIComponent(botName)}/message`, body, {
+  let url: string;
+  if (opts?.chatId) {
+    url = `/chats/${encodeURIComponent(opts.chatId)}/message`;
+  } else {
+    url = `/bots/${encodeURIComponent(botName)}/message`;
+    body.userids = userId;
+  }
+
+  const result = await cliqFetch(ctx, "POST", url, body, {
     companyId: opts?.companyId,
     serviceId: opts?.serviceId,
   });
