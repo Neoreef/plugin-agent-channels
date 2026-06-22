@@ -63,6 +63,9 @@ function renderChannelHistory(channelId: string): string | undefined {
 /** Active queries — prevents concurrent runs per conversation (keyed by convKey). */
 const activeQueries = new Map<string, ActiveQuery>();
 
+/** Channels we've already emitted the one-time payload-shape probe for. */
+const loggedChannelProbe = new Set<string>();
+
 /**
  * Sanitize Cliq webhook payload.
  * Deluge injects control characters that break JSON.parse.
@@ -89,7 +92,7 @@ type CliqWebhookPayload = {
   // Self-relay markers (a bot's own/teammate reply re-entering as a channel msg)
   _relay?: boolean;
   _relayDepth?: number;
-  operation?: string; // "message_sent" | "added" | "removed" | ...
+  operation?: string; // "message_sent" | "message_edited" | "added" | "removed" | "thread_closed" | ...
   message?: string;
   text?: string;
   type?: string;
@@ -97,12 +100,12 @@ type CliqWebhookPayload = {
   key?: string;
   // Rich context the Deluge handlers send (skill: zoho-cliq-messaging)
   message_details?: {
-    message?: {
-      text?: string;
-      content?: { text?: string };
-      file?: CliqFile;
-      replied_message?: { text?: string; sender?: { name?: string }; file?: CliqFile };
-    };
+    message?: CliqMessageObject;
+  };
+  // Channel/participation handler shape: text + mentions + reply + file nest
+  // under data.message (a separate Deluge script with a divergent contract).
+  data?: {
+    message?: CliqMessageObject;
   };
   attachments?: CliqFile[];
   // Reactions (only present once a Deluge reaction handler is added — see #30)
@@ -112,17 +115,69 @@ type CliqWebhookPayload = {
 /** A Cliq file attachment — download via `url` (the hash `id` doesn't work). */
 type CliqFile = { name?: string; id?: string; type?: string; url?: string };
 
+/** A message object as nested under `message_details.message` (DM/mention
+ *  handler) or `data.message` (channel participation handler). Both Deluge
+ *  scripts use this same inner shape; only the wrapper differs. */
+type CliqMessageObject = {
+  text?: string;
+  content?: { text?: string; file?: CliqFile };
+  file?: CliqFile;
+  mentions?: Array<{ name?: string; id?: string; bot_unique_name?: string }>;
+  replied_message?: {
+    text?: string;
+    sender?: { name?: string };
+    file?: CliqFile;
+    content?: { text?: string };
+  };
+};
+
+/** The message object — DM/mention handler nests it under `message_details`,
+ *  the channel participation handler under `data`. Prefer whichever is present. */
+function messageObjectOf(payload: CliqWebhookPayload): CliqMessageObject | undefined {
+  return payload.message_details?.message ?? payload.data?.message;
+}
+
+/**
+ * Extract the message text. The channel participation handler nests text under
+ * `data.message.text` / `data.message.content.text`; the DM handler sends it at
+ * the top level (`message`/`text`). Reading only the top level dropped every
+ * channel message as "empty" (NEO-205). Mirrors old monitor.ts:204.
+ */
+export function extractMessageText(payload: CliqWebhookPayload): string {
+  const msg = messageObjectOf(payload);
+  return msg?.text ?? msg?.content?.text ?? payload.message ?? payload.text ?? "";
+}
+
+/** Resolve the participation operation and classify it. Defaults to
+ *  `message_sent` for the legacy bot/DM handler (which sends no `operation`). */
+export function resolveOperation(payload: CliqWebhookPayload): {
+  operation: string;
+  isMessageOp: boolean;
+  isSilent: boolean;
+} {
+  const operation = payload.operation ?? "message_sent";
+  return {
+    operation,
+    isMessageOp: operation === "message_sent" || operation === "message_edited",
+    isSilent: operation === "thread_closed" || operation === "removed_from_thread",
+  };
+}
+
 /** Pull reply context + file attachments + reactions out of the payload. */
-function extractCliqContext(payload: CliqWebhookPayload): {
+export function extractCliqContext(payload: CliqWebhookPayload): {
   repliedText?: string;
   files: CliqFile[];
   reactions: string[];
 } {
-  const msg = payload.message_details?.message;
-  const repliedText = msg?.replied_message?.text?.trim() || undefined;
+  const msg = messageObjectOf(payload);
+  const replied = msg?.replied_message;
+  const repliedText = (replied?.text ?? replied?.content?.text)?.trim() || undefined;
   const files: CliqFile[] = [];
+  // File can sit at `content.file` (standard) or top-level `.file` (Cliq file
+  // messages) — for both the DM and participation wrappers. Old monitor.ts:695.
+  if (msg?.content?.file?.url) files.push(msg.content.file);
   if (msg?.file?.url) files.push(msg.file);
-  if (msg?.replied_message?.file?.url) files.push(msg.replied_message.file);
+  if (replied?.file?.url) files.push(replied.file);
   for (const f of payload.attachments ?? []) if (f?.url) files.push(f);
   const reactions = (payload.reactions ?? [])
     .map((r) => r.emoji || r.name || "")
@@ -141,35 +196,50 @@ type ChannelContext = {
 };
 
 /** Detect channel vs DM and pull the channel routing fields out of the payload. */
-function extractChannelContext(
+export function extractChannelContext(
   payload: CliqWebhookPayload,
   chatId: string | undefined,
   senderId: string | undefined,
 ): ChannelContext {
   const channelName = payload.channel?.unique_name ?? payload.chat?.channel_unique_name ?? "";
-  const isChannel = Boolean(channelName || payload.chat?.type === "channel");
+  // Participation payloads set chat.type to "channel" or "groupchat"; the legacy
+  // bot handler sends a separate channel field. Old monitor.ts:238-245.
+  const chatType = payload.chat?.type;
+  const isChannel = Boolean(channelName || chatType === "channel" || chatType === "groupchat");
   // Prefer a stable id for keying: chatId, else the channel unique name.
   const channelId = chatId || channelName;
   const channelLabel = payload.chat?.title || payload.channel?.name || (channelName ? `#${channelName}` : "channel");
+  // Mentions live under data.message.mentions for participation payloads; the
+  // legacy handler puts them top-level. Reading only the top level made
+  // botWasMentioned always-false in channels (default requireMention:true →
+  // every channel message gated out). Old monitor.ts:321.
+  const mentions = payload.data?.message?.mentions ?? payload.mentions ?? [];
   return {
     isChannel,
     channelId,
     channelName,
     channelLabel,
-    mentions: payload.mentions ?? [],
+    mentions,
     senderIsBot: isBotSender(senderId, payload._relay),
     relayDepth: payload._relayDepth ?? 0,
   };
 }
 
-/** Was this bot @mentioned in the message? */
-function botWasMentioned(
+/** Was this bot @mentioned in the message? Reads the structured mentions list,
+ *  then falls back to scanning the raw text for `@unique_name` — some
+ *  participation payloads carry the mention in the text but not the array. */
+export function botWasMentioned(
   mentions: Array<{ name?: string; id?: string; bot_unique_name?: string }>,
   botUniqueName: string,
+  text?: string,
 ): boolean {
-  return mentions.some(
+  if (mentions.some(
     (m) => m.bot_unique_name === botUniqueName || m.name === botUniqueName || m.id === botUniqueName,
-  );
+  )) return true;
+  // Last-resort text scan (old monitor.ts:321). Unique names are alnum/_; a
+  // case-insensitive substring on "@name" is sufficient and avoids regex escaping.
+  if (text && text.toLowerCase().includes(`@${botUniqueName.toLowerCase()}`)) return true;
+  return false;
 }
 
 export async function handleCliqWebhook(
@@ -199,7 +269,9 @@ export async function handleCliqWebhook(
     payload.user?.name ??
     ([payload.user?.first_name, payload.user?.last_name].filter(Boolean).join(" ") || "User");
   const botUniqueName = payload.bot_unique_name ?? payload.bot?.unique_name;
-  const messageText = payload.message ?? payload.text ?? "";
+  // Reads data.message.text first (channel participation) before the top-level
+  // DM fields — without this every channel message looked empty (NEO-205).
+  const messageText = extractMessageText(payload);
   // Deluge payload has no bot display name; fall back to the unique name
   const botDisplayName: string | undefined = payload.bot?.name ?? botUniqueName;
 
@@ -214,11 +286,21 @@ export async function handleCliqWebhook(
     if (handled) return;
   }
 
+  // Operation-aware gating: the participation handler tags events with an
+  // operation; the legacy DM/bot handler sends none (default "message_sent").
+  const { operation, isMessageOp, isSilent } = resolveOperation(payload);
+  if (isSilent) {
+    ctx.logger.info(`Cliq webhook: ignoring operation "${operation}"`);
+    return;
+  }
+
   const { repliedText, files, reactions } = extractCliqContext(payload);
 
-  // Allow file-only / reply-only / reaction-only messages (empty text is valid
-  // when a file is attached — skill: zoho-cliq-messaging).
-  if (!messageText.trim() && files.length === 0 && !repliedText && reactions.length === 0) {
+  // Empty/text-required guard applies ONLY to message ops. Roster ops
+  // (added/removed) legitimately carry no text — they're handled below as
+  // roster updates. Allow file-only / reply-only / reaction-only messages too
+  // (empty text is valid when a file is attached — skill: zoho-cliq-messaging).
+  if (isMessageOp && !messageText.trim() && files.length === 0 && !repliedText && reactions.length === 0) {
     ctx.logger.info(`Cliq webhook: empty message from ${userName}, ignoring`);
     return;
   }
@@ -245,6 +327,16 @@ export async function handleCliqWebhook(
   let rosterContext: string | undefined;
   let channelGuidance: string | undefined;
   if (ch.isChannel) {
+    // One-time per-channel probe to confirm the payload shape in prod (which
+    // fields actually arrive) without spamming the log on every message.
+    if (!loggedChannelProbe.has(ch.channelId)) {
+      loggedChannelProbe.add(ch.channelId);
+      ctx.logger.info(
+        `Cliq channel probe ${ch.channelLabel}: op=${operation} chat.type=${payload.chat?.type ?? "-"} ` +
+        `channel_unique_name=${payload.chat?.channel_unique_name ?? "-"} hasData.message=${Boolean(payload.data?.message)} ` +
+        `mentions=${ch.mentions.length} textLen=${messageText.length}`,
+      );
+    }
     const groups = await readGroupsConfig(ctx);
     const policy = resolveGroupPolicy(groups, ch.channelId, ch.channelName);
     if (!policy.enabled) {
@@ -256,11 +348,18 @@ export async function handleCliqWebhook(
     // Roster: record this bot + (human) speaker; buffer every message for context.
     recordChannelBot(ch.channelId, { botUniqueName, agentId, displayName: botDisplayName });
     if (!ch.senderIsBot) noteHumanParticipant(ch.channelId, { id: userId, name: userName, email: payload.sender?.email ?? payload.user?.email });
-    recordChannelHistory(ch.channelId, ch.senderIsBot ? `${userName} (agent)` : userName, messageText);
+    if (isMessageOp) recordChannelHistory(ch.channelId, ch.senderIsBot ? `${userName} (agent)` : userName, messageText);
+
+    // Roster ops (added/removed) carry no message to answer — the roster is now
+    // updated, so we're done.
+    if (!isMessageOp) {
+      ctx.logger.info(`Cliq channel ${ch.channelLabel}: roster op "${operation}", updated roster only`);
+      return;
+    }
 
     // Mention gating: when required and this bot isn't @mentioned, stay silent
     // (the message is already buffered above for later context).
-    if (policy.requireMention && !botWasMentioned(ch.mentions, botUniqueName)) {
+    if (policy.requireMention && !botWasMentioned(ch.mentions, botUniqueName, messageText)) {
       ctx.logger.info(`Cliq channel ${ch.channelLabel}: ${botUniqueName} not mentioned, buffering only`);
       return;
     }
@@ -496,6 +595,7 @@ async function runChatInBackground(
       userId,
       agentName: titleCaseTool(botUniqueName),
       companyId,
+      chatId,
     });
     await stream.setCardState({ kind: "waiting", title: "Waiting" });
 

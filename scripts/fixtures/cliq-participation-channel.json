@@ -1,0 +1,22 @@
+{
+  "bot_unique_name": "marc",
+  "operation": "message_sent",
+  "sender": { "id": "u-123", "name": "Bernesto", "email": "bernesto@neoreef.com" },
+  "chat": {
+    "id": "chat-eng-789",
+    "type": "channel",
+    "title": "Engineering",
+    "channel_unique_name": "engineering"
+  },
+  "data": {
+    "message": {
+      "text": "@marc can you review the deploy?",
+      "content": { "text": "@marc can you review the deploy?" },
+      "mentions": [{ "name": "marc", "bot_unique_name": "marc" }],
+      "replied_message": {
+        "text": "deploy went out at 3pm",
+        "sender": { "name": "Ops" }
+      }
+    }
+  }
+}

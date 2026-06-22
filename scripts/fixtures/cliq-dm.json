@@ -1,0 +1,12 @@
+{
+  "bot_unique_name": "marc",
+  "sender": { "id": "u-123", "name": "Bernesto", "email": "bernesto@neoreef.com" },
+  "chat": { "id": "dm-456", "type": "bot" },
+  "message": "hello marc, what's the status?",
+  "message_details": {
+    "message": {
+      "text": "hello marc, what's the status?",
+      "content": { "text": "hello marc, what's the status?" }
+    }
+  }
+}
