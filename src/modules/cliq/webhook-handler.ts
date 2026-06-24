@@ -14,6 +14,7 @@ import {
   sendCliqMessage,
   sendCliqChatMessage,
   sendCliqChannelMessage,
+  addBotToChannel,
   getChatEditCapability,
   setChatEditCapability,
   downloadCliqFile,
@@ -633,7 +634,16 @@ async function runChatInBackground(
       const senderName = capitalize(args.botDisplayName || botUniqueName);
       let nativeOk = false;
       if (channelName) {
-        const r = await sendCliqChannelMessage(ctx, channelName, botUniqueName, finalText, { companyId });
+        let r = await sendCliqChannelMessage(ctx, channelName, botUniqueName, finalText, { companyId });
+        // A bot answers @mentions via a subscription, not membership — so its
+        // first native channel post can 400 "bot_not_member". Add it to the
+        // channel, then retry once so it posts as its real self.
+        if (r.status === 400) {
+          const added = await addBotToChannel(ctx, channelName, botUniqueName, { companyId });
+          if (added >= 200 && added < 300) {
+            r = await sendCliqChannelMessage(ctx, channelName, botUniqueName, finalText, { companyId });
+          }
+        }
         nativeOk = r.status >= 200 && r.status < 300;
       }
       if (!nativeOk) {

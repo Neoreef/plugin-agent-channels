@@ -467,6 +467,24 @@ export async function logCliqChannelDiagnostics(
 }
 
 /**
+ * Add a bot to a channel (by channel unique name) so it can post AS itself via
+ * `/channelsbyname?bot_unique_name`. A bot answers @mentions through a bot-level
+ * subscription, which is NOT channel membership — so a mapped bot may need to be
+ * added before its first native channel reply (NEO-206). Returns the HTTP status.
+ */
+export async function addBotToChannel(
+  ctx: PluginContext,
+  channelName: string,
+  botName: string,
+  scope: { companyId?: string; serviceId?: string } = {},
+): Promise<number> {
+  const path = `/channelsbyname/${encodeURIComponent(channelName)}/bots/${encodeURIComponent(botName)}`;
+  const result = await cliqFetch(ctx, "POST", path, {}, scope);
+  ctx.logger.info(`Cliq addBotToChannel #${channelName} bot=${botName}: status=${result.status} ${JSON.stringify(result.data).slice(0, 200)}`);
+  return result.status;
+}
+
+/**
  * Post into a channel **as a specific bot**, by channel unique name. Unlike
  * `/chats/{chatId}/message` (which renders every reply with the same anonymous
  * shared-connection sender), `/channelsbyname/{name}/message?bot_unique_name=…`
