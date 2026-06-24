@@ -478,10 +478,23 @@ export async function addBotToChannel(
   botName: string,
   scope: { companyId?: string; serviceId?: string } = {},
 ): Promise<number> {
-  const path = `/channelsbyname/${encodeURIComponent(channelName)}/bots/${encodeURIComponent(botName)}`;
-  const result = await cliqFetch(ctx, "POST", path, {}, scope);
-  ctx.logger.info(`Cliq addBotToChannel #${channelName} bot=${botName}: status=${result.status} ${JSON.stringify(result.data).slice(0, 200)}`);
-  return result.status;
+  const b = encodeURIComponent(botName);
+  const c = encodeURIComponent(channelName);
+  // Zoho's exact route isn't documented in our repo; the MCP connector models it
+  // as bot-in-path + channel_unique_name-in-body. Try the most likely shapes and
+  // stop at the first 2xx, logging each so the working one is captured.
+  const attempts: Array<{ method: string; path: string; body?: unknown }> = [
+    { method: "POST", path: `/bots/${b}/channels`, body: { channel_unique_name: channelName } },
+    { method: "POST", path: `/channelsbyname/${c}/members`, body: { bot_unique_names: [botName] } },
+    { method: "POST", path: `/channelsbyname/${c}/bots`, body: { bot_unique_names: [botName] } },
+    { method: "PUT", path: `/channelsbyname/${c}/bots/${b}`, body: {} },
+  ];
+  for (const a of attempts) {
+    const result = await cliqFetch(ctx, a.method, a.path, a.body, scope);
+    ctx.logger.info(`Cliq addBotToChannel try ${a.method} ${a.path}: status=${result.status} ${JSON.stringify(result.data).slice(0, 160)}`);
+    if (result.status >= 200 && result.status < 300) return result.status;
+  }
+  return 0;
 }
 
 /**
