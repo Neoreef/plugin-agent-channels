@@ -43,6 +43,7 @@ import {
   recordAgentMessage,
 } from "./guardrails.js";
 import { readGroupsConfig, resolveGroupPolicy } from "./group-policy.js";
+import { broadcastSelfSelectGuidance, isSilentReply } from "./silent-reply.js";
 import type { ActiveQuery } from "../../lib/types.js";
 
 /** Per-channel rolling history of recent messages (sender + text), for context
@@ -374,6 +375,10 @@ export async function handleCliqWebhook(
   let attributedText = messageText;
   let rosterContext: string | undefined;
   let channelGuidance: string | undefined;
+  // Broadcast (always-on) channel: every agent sees every message and
+  // self-selects whether to reply (NEO-209). Drives the self-selection guidance
+  // + silent-token suppression in the background turn.
+  let broadcast = false;
   if (ch.isChannel) {
     // Cache the channel unique_name (participation payloads have it; the mention
     // payload that triggers the reply does not) for the attributed send.
@@ -401,6 +406,7 @@ export async function handleCliqWebhook(
       return;
     }
     channelGuidance = policy.channelGuidance;
+    broadcast = !policy.requireMention;
 
     // Roster: record this bot + (human) speaker; buffer every message for context.
     recordChannelBot(ch.channelId, { botUniqueName, agentId, displayName: botDisplayName });
@@ -483,7 +489,7 @@ export async function handleCliqWebhook(
     files,
     reactions,
     channel: ch.isChannel
-      ? { channelId: ch.channelId, channelName: ch.channelName, channelLabel: ch.channelLabel, rosterContext, channelGuidance }
+      ? { channelId: ch.channelId, channelName: ch.channelName, channelLabel: ch.channelLabel, rosterContext, channelGuidance, broadcast }
       : undefined,
   }).catch((err) => {
     ctx.logger.error(`Cliq background chat crashed: ${String(err)}`);
@@ -514,6 +520,9 @@ type BackgroundChatArgs = {
     channelLabel: string;
     rosterContext?: string;
     channelGuidance?: string;
+    /** Broadcast (always-on) channel — inject self-selection guidance + suppress
+     *  silent-token replies so non-participating agents stay quiet (NEO-209). */
+    broadcast?: boolean;
   };
 };
 
@@ -592,6 +601,9 @@ async function runChatInBackground(
   // the roster, and recent channel history into the system-level context.
   const honchoRecallText = honchoScope ? (await honchoRecall(ctx, honchoScope, messageText)) ?? undefined : undefined;
   const memoryContext = [
+    // Broadcast self-selection leads the context so the agent decides up front
+    // whether to speak or emit the silent token (NEO-209).
+    ch?.broadcast ? broadcastSelfSelectGuidance() : undefined,
     ch?.channelGuidance,
     ch?.rosterContext,
     ch ? renderChannelHistory(ch.channelId) : undefined,
@@ -623,6 +635,14 @@ async function runChatInBackground(
       });
       logDone(ctx, agentId, result);
       await saveSession(ctx, convKey, result.sessionId);
+      // Broadcast self-selection: an agent with nothing to add replies with just
+      // the silent token (or an empty turn). Suppress delivery so lurking agents
+      // stay quiet — the inbound message is already buffered for their context
+      // (NEO-209). Session is saved above so continuity is preserved.
+      if (ch.broadcast && (!result.text.trim() || isSilentReply(result.text))) {
+        ctx.logger.info(`Cliq channel ${ch.channelLabel}: ${botUniqueName} self-selected silent, not delivering`);
+        return;
+      }
       const finalText = finalTextOf(result);
       // Prefer NATIVE attribution: post as the bot via /channelsbyname so the
       // reply shows the bot's real name + avatar (the bots ARE channel members —

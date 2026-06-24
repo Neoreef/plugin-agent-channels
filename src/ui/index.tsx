@@ -1027,8 +1027,9 @@ function ChannelPolicySection() {
       <p style={muted}>
         By default agents only reply in a channel when <strong>@mentioned</strong>. Add a row keyed by
         channel id, unique name, or <code>*</code> (default for all channels) and turn on
-        <strong> Broadcast</strong> so every message triggers agents — bounded by the depth + hourly
-        guardrails below.
+        <strong> Broadcast</strong> so every message reaches every agent. In broadcast each agent
+        <strong> self-selects</strong> — it stays silent unless it can add value or is addressed — and the
+        depth + hourly guardrails below bound the flywheel.
       </p>
 
       <div style={{ ...row, marginBottom: "0.5rem" }}>
