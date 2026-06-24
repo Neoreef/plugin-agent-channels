@@ -38,7 +38,7 @@ const ok = (msg) => { passed++; console.log(`  ✓ ${msg}`); };
  * runChatInBackground, or be dropped by a guard? Returns the resolved fields
  * too so the test can assert on them.
  */
-function decide(payload, botUniqueName, requireMention) {
+function decide(payload, botUniqueName, requireMention, isMentionDelivery = false) {
   const messageText = extractMessageText(payload);
   // Mirror the handler's identity resolution: bot id is the only hard
   // requirement; sender id is optional and defaults to "" (NEO-206).
@@ -58,7 +58,10 @@ function decide(payload, botUniqueName, requireMention) {
   if (!ch.isChannel && !userId) {
     return { dispatched: false, reason: "dm no sender", messageText, ch, operation };
   }
-  if (ch.isChannel && isMessageOp && requireMention && !botWasMentioned(ch.mentions, botUniqueName, messageText)) {
+  // A dedicated MentionHandler delivery IS the mention (Zoho only fires it for
+  // the mentioned bot) — it bypasses payload-based detection, which can't match
+  // Cliq's display-name/id mention representation to the bot's unique_name.
+  if (ch.isChannel && isMessageOp && requireMention && !isMentionDelivery && !botWasMentioned(ch.mentions, botUniqueName, messageText)) {
     return { dispatched: false, reason: "not mentioned", messageText, ch, operation };
   }
   if (ch.isChannel && !isMessageOp) {
@@ -111,6 +114,22 @@ function main() {
   assert.equal(cNoSender.ch.isChannel, true);
   assert.equal(cNoSender.dispatched, true, `channel w/o sender id expected dispatch, got: ${cNoSender.reason}`);
   ok("channel: message with no sender id still dispatches (was silently dropped)");
+
+  // ─── 2c. Channel @mention via the dedicated MentionHandler (NEO-206) ──────
+  // The real MentionHandler payload: chat.type "groupchat", top-level message,
+  // and a `mentions` array using Cliq's display-name/id form ("Marc"/numeric id)
+  // that does NOT match the bot's unique_name "marc". Without honoring the
+  // handler-name signal, requireMention gates it out — the live bug.
+  const mention = load("cliq-mention-channel.json");
+  assert.equal(extractChannelContext(mention, mention.chat.id, mention.sender.id).isChannel, true);
+  assert.equal(botWasMentioned(mention.mentions, "marc", extractMessageText(mention)), false,
+    "payload mention form should NOT match unique_name (that's why we need the header)");
+  // Without the mention-delivery signal → wrongly gated:
+  assert.equal(decide(mention, "marc", true, /* isMentionDelivery */ false).reason, "not mentioned");
+  // With it → dispatches to the channel:
+  const md = decide(mention, "marc", true, /* isMentionDelivery */ true);
+  assert.equal(md.dispatched, true, `mention delivery expected dispatch, got: ${md.reason}`);
+  ok("channel: MentionHandler delivery dispatches despite unmatched payload mentions");
 
   // ─── 3. groupchat chat.type also counts as a channel ──────────────────────
   const groupchat = structuredClone(channel);

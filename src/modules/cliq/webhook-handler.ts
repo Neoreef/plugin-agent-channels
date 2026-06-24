@@ -242,10 +242,21 @@ export function botWasMentioned(
   return false;
 }
 
+/** Read a header case-insensitively (Deluge sends `dre-function-name` lower). */
+function headerValue(headers: Record<string, string | string[]> | undefined, name: string): string {
+  if (!headers) return "";
+  const want = name.toLowerCase();
+  for (const [k, v] of Object.entries(headers)) {
+    if (k.toLowerCase() === want) return Array.isArray(v) ? v.join(",") : v;
+  }
+  return "";
+}
+
 export async function handleCliqWebhook(
   ctx: PluginContext,
   rawBody: string | undefined,
   parsedBody: unknown,
+  headers?: Record<string, string | string[]>,
 ): Promise<void> {
   // Parse payload
   let payload: CliqWebhookPayload;
@@ -279,6 +290,15 @@ export async function handleCliqWebhook(
   const messageText = extractMessageText(payload);
   // Deluge payload has no bot display name; fall back to the unique name
   const botDisplayName: string | undefined = payload.bot?.name ?? botUniqueName;
+
+  // Zoho fires a dedicated `…MentionHandler` Deluge function ONLY when this bot
+  // was @mentioned, and a `…ParticipationHandler` for every channel message.
+  // The participation payload arrives with an EMPTY mentions array (mentions=0),
+  // so structural/text mention detection can't see the mention — but the handler
+  // name is Zoho's authoritative "this bot was mentioned" signal. Honor it
+  // directly so a channel @mention dispatches even under requireMention (NEO-206).
+  const delugeHandler = headerValue(headers, "dre-function-name");
+  const isMentionDelivery = /MentionHandler/i.test(delugeHandler);
 
   // The bot identity is the only hard requirement (old monitor.ts:170/197-198).
   if (!botUniqueName) {
@@ -348,7 +368,8 @@ export async function handleCliqWebhook(
       ctx.logger.info(
         `Cliq channel probe ${ch.channelLabel}: op=${operation} chat.type=${payload.chat?.type ?? "-"} ` +
         `channel_unique_name=${payload.chat?.channel_unique_name ?? "-"} hasData.message=${Boolean(payload.data?.message)} ` +
-        `mentions=${ch.mentions.length} textLen=${messageText.length} hasSenderId=${Boolean(userId)}`,
+        `mentions=${ch.mentions.length} textLen=${messageText.length} hasSenderId=${Boolean(userId)} ` +
+        `handler=${delugeHandler || "-"} mentionDelivery=${isMentionDelivery}`,
       );
     }
     const groups = await readGroupsConfig(ctx);
@@ -372,8 +393,11 @@ export async function handleCliqWebhook(
     }
 
     // Mention gating: when required and this bot isn't @mentioned, stay silent
-    // (the message is already buffered above for later context).
-    if (policy.requireMention && !botWasMentioned(ch.mentions, botUniqueName, messageText)) {
+    // (the message is already buffered above for later context). A dedicated
+    // MentionHandler delivery IS the mention — Zoho only fires it for the
+    // mentioned bot — so it bypasses the payload-based check (mentions arrive
+    // empty on the participation path).
+    if (policy.requireMention && !isMentionDelivery && !botWasMentioned(ch.mentions, botUniqueName, messageText)) {
       ctx.logger.info(`Cliq channel ${ch.channelLabel}: ${botUniqueName} not mentioned, buffering only`);
       return;
     }

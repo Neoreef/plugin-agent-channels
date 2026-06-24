@@ -18,7 +18,7 @@ export const cliqChannel: ChannelModule = {
   },
 
   async handleWebhook(ctx, input) {
-    await handleCliqWebhook(ctx, input.rawBody, input.parsedBody);
+    await handleCliqWebhook(ctx, input.rawBody, input.parsedBody, input.headers);
     return { handled: true };
   },
 };

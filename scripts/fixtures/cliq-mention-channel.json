@@ -1,0 +1,16 @@
+{
+  "bot_unique_name": "marc",
+  "message": "hey can you review the deploy?",
+  "message_details": {
+    "message": { "text": "hey can you review the deploy?" }
+  },
+  "mentions": [{ "name": "Marc", "id": "99887766" }],
+  "user": { "id": "u-123", "first_name": "Bernesto", "last_name": "" },
+  "sender": { "id": "u-123", "name": "Bernesto", "email": "bernesto@neoreef.com" },
+  "channel": { "name": "Marketing" },
+  "chat": {
+    "id": "chat-mktg-001",
+    "type": "groupchat",
+    "title": "Marketing"
+  }
+}
