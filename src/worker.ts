@@ -37,6 +37,7 @@ import { getChannel, getChannelByServiceType } from "./lib/channel-registry.js";
 // Side-effect import: registers all built-in channel modules into the registry.
 import "./channels.js";
 import { getBotMappings, saveBotMappings } from "./modules/cliq/bot-mapping.js";
+import { readGroupsConfig, saveGroupsConfig, type GroupsConfig } from "./modules/cliq/group-policy.js";
 import {
   getServiceNotify,
   saveServiceNotify,
@@ -269,6 +270,10 @@ const plugin: PaperclipPlugin = definePlugin({
       return await getBotMappings(ctx);
     });
 
+    ctx.data.register("groups-config", async () => {
+      return await readGroupsConfig(ctx);
+    });
+
     ctx.data.register("paperclip-companies", async () => {
       try {
         const companies = await ctx.companies.list({ limit: 50, offset: 0 });
@@ -328,6 +333,13 @@ const plugin: PaperclipPlugin = definePlugin({
     ctx.actions.register("save-bot-mappings", async (params) => {
       const mappings = params.mappings as BotAgentMapping[];
       await saveBotMappings(ctx, mappings);
+      return { ok: true };
+    });
+
+    ctx.actions.register("save-groups-config", async (params) => {
+      const config = params.config as GroupsConfig;
+      if (!config) return { ok: false, error: "config required" };
+      await saveGroupsConfig(ctx, config);
       return { ok: true };
     });
 

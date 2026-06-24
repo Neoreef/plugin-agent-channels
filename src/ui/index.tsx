@@ -774,6 +774,8 @@ function CliqConfig({ serviceId, companyId }: { serviceId: string; companyId: st
         </div>
       )}
 
+      {status?.connected && <ChannelPolicySection />}
+
       {status?.connected && <ServiceNotifySection serviceId={serviceId} scopeCompanyId={companyId} companies={companies} />}
     </div>
   );
@@ -947,6 +949,169 @@ function ServiceNotifySection({ serviceId, scopeCompanyId, companies }: { servic
             </div>
           )}
         </>
+      )}
+    </div>
+  );
+}
+
+// ─── Channel policy (broadcast mode + per-channel guardrails) ───────────────
+
+type GroupEntry = {
+  allow?: boolean;
+  requireMention?: boolean;
+  maxMessagesPerAgentPerHour?: number;
+  maxDepth?: number;
+  channelGuidance?: string;
+};
+type GroupsConfig = {
+  policy?: "open" | "allowlist" | "disabled";
+  channels?: Record<string, GroupEntry>;
+};
+type ChannelRow = { key: string; entry: GroupEntry };
+
+/**
+ * "Channel Policy" for Cliq group channels (NEO-209). Writes the instance
+ * `cliq.groups` config that group-policy.ts reads. By default agents only reply
+ * in a channel when @mentioned; toggle a channel (or the `*` default) to
+ * broadcast so every message triggers agents, bounded by the depth + hourly
+ * guardrails. Mirrors the bot-mappings read/write plumbing.
+ */
+function ChannelPolicySection() {
+  const { data: groups, refresh } = usePluginData<GroupsConfig>("groups-config");
+  const save = usePluginAction("save-groups-config");
+
+  const [policy, setPolicy] = useState<"open" | "allowlist" | "disabled">("open");
+  const [rows, setRows] = useState<ChannelRow[]>([]);
+  useEffect(() => {
+    if (groups) {
+      setPolicy(groups.policy ?? "open");
+      setRows(Object.entries(groups.channels ?? {}).map(([key, entry]) => ({ key, entry })));
+    }
+  }, [groups]);
+
+  function toConfig(p: typeof policy, rs: ChannelRow[]): GroupsConfig {
+    const channels: Record<string, GroupEntry> = {};
+    for (const r of rs) {
+      const k = r.key.trim();
+      if (k) channels[k] = r.entry;
+    }
+    return { policy: p, channels };
+  }
+  async function persist(p: typeof policy, rs: ChannelRow[]) {
+    setPolicy(p);
+    setRows(rs);
+    await save({ config: toConfig(p, rs) });
+    refresh();
+  }
+  function patchEntry(idx: number, patch: Partial<GroupEntry>) {
+    return rows.map((r, i) => (i === idx ? { ...r, entry: { ...r.entry, ...patch } } : r));
+  }
+  // Parse a numeric field: blank clears it back to the guardrail default.
+  function num(v: string): number | undefined {
+    const n = parseInt(v, 10);
+    return Number.isFinite(n) && n >= 0 ? n : undefined;
+  }
+
+  return (
+    <div style={section}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "0.25rem" }}>
+        <h4 style={{ margin: 0 }}>Channel Policy</h4>
+        <button
+          type="button"
+          style={btnSmall}
+          onClick={() => persist(policy, [...rows, { key: rows.some((r) => r.key === "*") ? "" : "*", entry: {} }])}
+        >
+          + Add channel
+        </button>
+      </div>
+      <p style={muted}>
+        By default agents only reply in a channel when <strong>@mentioned</strong>. Add a row keyed by
+        channel id, unique name, or <code>*</code> (default for all channels) and turn on
+        <strong> Broadcast</strong> so every message triggers agents — bounded by the depth + hourly
+        guardrails below.
+      </p>
+
+      <div style={{ ...row, marginBottom: "0.5rem" }}>
+        <label style={{ ...muted, display: "flex", alignItems: "center", gap: 4 }}>
+          Policy
+          <select
+            style={selectStyle}
+            value={policy}
+            onChange={(e) => persist(e.target.value as typeof policy, rows)}
+          >
+            <option value="open">open (respond unless disallowed)</option>
+            <option value="allowlist">allowlist (only listed channels)</option>
+            <option value="disabled">disabled (no channel responses)</option>
+          </select>
+        </label>
+      </div>
+
+      {rows.map((r, idx) => (
+        <div key={idx} style={{ ...cardStyle, padding: "0.75rem 1rem", marginBottom: "0.5rem" }}>
+          <div style={{ ...row, marginBottom: "0.5rem", flexWrap: "wrap" }}>
+            <input
+              style={{ ...inputStyle, flex: 1, minWidth: 160 }}
+              defaultValue={r.key}
+              placeholder="Channel id, unique name, or *"
+              title="Channel id, unique_name, or * for the default applied to all channels"
+              onBlur={(e) => persist(policy, rows.map((x, i) => (i === idx ? { ...x, key: e.target.value } : x)))}
+            />
+            <label style={{ ...muted, display: "flex", alignItems: "center", gap: 4 }}>
+              <input
+                type="checkbox"
+                checked={r.entry.requireMention === false}
+                onChange={(e) => persist(policy, patchEntry(idx, { requireMention: e.target.checked ? false : undefined }))}
+              /> Broadcast (no @mention needed)
+            </label>
+            {policy === "allowlist" && (
+              <label style={{ ...muted, display: "flex", alignItems: "center", gap: 4 }}>
+                <input
+                  type="checkbox"
+                  checked={r.entry.allow === true}
+                  onChange={(e) => persist(policy, patchEntry(idx, { allow: e.target.checked ? true : undefined }))}
+                /> allow
+              </label>
+            )}
+            <button type="button" style={btnSmallDanger} onClick={() => persist(policy, rows.filter((_, i) => i !== idx))}>x</button>
+          </div>
+          <div style={{ ...row, marginBottom: "0.5rem", flexWrap: "wrap" }}>
+            <label style={{ ...muted, display: "flex", alignItems: "center", gap: 4 }}>
+              max msgs/agent/hr
+              <input
+                style={{ ...inputStyle, width: 70 }}
+                type="number"
+                min={0}
+                defaultValue={r.entry.maxMessagesPerAgentPerHour ?? ""}
+                placeholder="30"
+                onBlur={(e) => persist(policy, patchEntry(idx, { maxMessagesPerAgentPerHour: num(e.target.value) }))}
+              />
+            </label>
+            <label style={{ ...muted, display: "flex", alignItems: "center", gap: 4 }}>
+              max bot↔bot depth
+              <input
+                style={{ ...inputStyle, width: 60 }}
+                type="number"
+                min={0}
+                defaultValue={r.entry.maxDepth ?? ""}
+                placeholder="3"
+                onBlur={(e) => persist(policy, patchEntry(idx, { maxDepth: num(e.target.value) }))}
+              />
+            </label>
+          </div>
+          <textarea
+            style={{ ...inputStyle, width: "100%", minHeight: 48, resize: "vertical" }}
+            defaultValue={r.entry.channelGuidance ?? ""}
+            placeholder="Optional channel guidance injected into the agent prompt for this channel"
+            onBlur={(e) => persist(policy, patchEntry(idx, { channelGuidance: e.target.value.trim() || undefined }))}
+          />
+        </div>
+      ))}
+
+      {rows.length === 0 && (
+        <p style={muted}>
+          No channel overrides — agents reply only when @mentioned. Click <strong>+ Add channel</strong>,
+          key it <code>*</code>, and enable Broadcast to have agents respond to every message.
+        </p>
       )}
     </div>
   );

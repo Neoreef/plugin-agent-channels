@@ -54,6 +54,11 @@ export async function readGroupsConfig(ctx: PluginContext): Promise<GroupsConfig
   return cfg ?? {};
 }
 
+/** Persist the `cliq.groups` instance config (written from plugin settings). */
+export async function saveGroupsConfig(ctx: PluginContext, cfg: GroupsConfig): Promise<void> {
+  await ctx.state.set({ scopeKind: "instance", stateKey: STATE_KEY }, cfg);
+}
+
 /** Pick the most specific config entry for a channel (by id, then name, then "*"). */
 function entryFor(cfg: GroupsConfig, channelId: string, channelName?: string): GroupEntry | undefined {
   const channels = cfg.channels ?? {};
