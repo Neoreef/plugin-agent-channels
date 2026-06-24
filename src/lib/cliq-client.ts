@@ -431,6 +431,37 @@ export async function sendCliqChatMessage(
 }
 
 /**
+ * One-shot diagnostic (NEO-206): resolve a channel from its chat id and log its
+ * real `unique_name` plus its member/bot list, so we can see exactly which bot
+ * unique_names Zoho considers channel members (the `/channelsbyname?bot_unique_name`
+ * send 400s with `bot_not_member` and we need to know the correct identifier).
+ */
+export async function logCliqChannelDiagnostics(
+  ctx: PluginContext,
+  chatId: string,
+  scope: { companyId?: string; serviceId?: string } = {},
+): Promise<void> {
+  try {
+    const chRes = await cliqFetch(ctx, "GET", `/channels?chat_ids=${encodeURIComponent(chatId)}`, undefined, scope);
+    const root = (chRes.data ?? {}) as Record<string, unknown>;
+    const list = (Array.isArray(root.channels) ? root.channels : Array.isArray(chRes.data) ? (chRes.data as unknown[]) : []) as Array<Record<string, unknown>>;
+    const ch = list[0] ?? root;
+    const channelId = (ch?.channel_id ?? ch?.id) as string | undefined;
+    ctx.logger.info(
+      `Cliq diag channel: chat=${chatId} status=${chRes.status} channel_id=${channelId ?? "-"} ` +
+      `unique_name=${(ch?.unique_name as string) ?? "-"} name=${(ch?.name as string) ?? "-"} ` +
+      `raw=${JSON.stringify(chRes.data).slice(0, 300)}`,
+    );
+    if (channelId) {
+      const mRes = await cliqFetch(ctx, "GET", `/channels/${encodeURIComponent(channelId)}/members`, undefined, scope);
+      ctx.logger.info(`Cliq diag members: status=${mRes.status} raw=${JSON.stringify(mRes.data).slice(0, 600)}`);
+    }
+  } catch (e) {
+    ctx.logger.info(`Cliq diag failed for chat ${chatId}: ${String(e)}`);
+  }
+}
+
+/**
  * Post into a channel **as a specific bot**, by channel unique name. Unlike
  * `/chats/{chatId}/message` (which renders every reply with the same anonymous
  * shared-connection sender), `/channelsbyname/{name}/message?bot_unique_name=…`

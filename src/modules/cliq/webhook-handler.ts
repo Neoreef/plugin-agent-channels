@@ -16,6 +16,7 @@ import {
   getChatEditCapability,
   setChatEditCapability,
   downloadCliqFile,
+  logCliqChannelDiagnostics,
 } from "../../lib/cliq-client.js";
 import { runAgentChat, type HarnessEvent } from "../../lib/harness.js";
 import { createCliqDraftStream } from "../../lib/draft-stream.js";
@@ -376,6 +377,9 @@ export async function handleCliqWebhook(
         `mentions=${ch.mentions.length} textLen=${messageText.length} hasSenderId=${Boolean(userId)} ` +
         `handler=${delugeHandler || "-"} mentionDelivery=${isMentionDelivery}`,
       );
+      // Ground-truth diagnostic: log the channel's real unique_name + member/bot
+      // list (NEO-206 attribution) — fire-and-forget so it never blocks dispatch.
+      if (chatId) void logCliqChannelDiagnostics(ctx, chatId, { companyId });
     }
     const groups = await readGroupsConfig(ctx);
     const policy = resolveGroupPolicy(groups, ch.channelId, ch.channelName);
