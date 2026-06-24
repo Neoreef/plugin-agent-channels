@@ -263,7 +263,12 @@ export async function handleCliqWebhook(
     return;
   }
 
-  const userId = payload.sender?.id ?? payload.user?.id;
+  // Sender id is optional: the channel participation Deluge script can post
+  // without a `sender.id`, and channel routing keys on the channel, not the
+  // speaker. Defaulting to "" (matching old monitor.ts:247) — only DM replies
+  // actually need it (guarded after channel detection below). Hard-requiring it
+  // here silently dropped EVERY channel message, mention or not (NEO-206).
+  const userId = payload.sender?.id ?? payload.user?.id ?? "";
   const userName =
     payload.sender?.name ??
     payload.user?.name ??
@@ -275,13 +280,15 @@ export async function handleCliqWebhook(
   // Deluge payload has no bot display name; fall back to the unique name
   const botDisplayName: string | undefined = payload.bot?.name ?? botUniqueName;
 
-  if (!userId || !botUniqueName) {
-    ctx.logger.error(`Cliq webhook: missing userId or botUniqueName`);
+  // The bot identity is the only hard requirement (old monitor.ts:170/197-198).
+  if (!botUniqueName) {
+    ctx.logger.error(`Cliq webhook: missing botUniqueName`);
     return;
   }
 
-  // Button callbacks (Approve/Deny on an approval card) arrive here too.
-  if (payload.type === "button_callback" && payload.key) {
+  // Button callbacks (Approve/Deny on an approval card) arrive here too — these
+  // always carry a sender id (the human who clicked).
+  if (payload.type === "button_callback" && payload.key && userId) {
     const handled = await handleApprovalButton(ctx, payload.key, userId, botUniqueName);
     if (handled) return;
   }
@@ -322,6 +329,13 @@ export async function handleCliqWebhook(
   const chatId = (payload.chat as { id?: string } | undefined)?.id;
   const ch = extractChannelContext(payload, chatId, userId);
 
+  // DMs are addressed back to the sender, so a DM with no sender id cannot be
+  // answered — bail (channels reply to the chat id, so they don't need it).
+  if (!ch.isChannel && !userId) {
+    ctx.logger.error(`Cliq webhook: DM from ${botUniqueName} has no sender id; cannot route a reply`);
+    return;
+  }
+
   // ─── Group-channel gating (policy · mention · flywheel) ─────────────────────
   let attributedText = messageText;
   let rosterContext: string | undefined;
@@ -334,7 +348,7 @@ export async function handleCliqWebhook(
       ctx.logger.info(
         `Cliq channel probe ${ch.channelLabel}: op=${operation} chat.type=${payload.chat?.type ?? "-"} ` +
         `channel_unique_name=${payload.chat?.channel_unique_name ?? "-"} hasData.message=${Boolean(payload.data?.message)} ` +
-        `mentions=${ch.mentions.length} textLen=${messageText.length}`,
+        `mentions=${ch.mentions.length} textLen=${messageText.length} hasSenderId=${Boolean(userId)}`,
       );
     }
     const groups = await readGroupsConfig(ctx);
@@ -347,7 +361,7 @@ export async function handleCliqWebhook(
 
     // Roster: record this bot + (human) speaker; buffer every message for context.
     recordChannelBot(ch.channelId, { botUniqueName, agentId, displayName: botDisplayName });
-    if (!ch.senderIsBot) noteHumanParticipant(ch.channelId, { id: userId, name: userName, email: payload.sender?.email ?? payload.user?.email });
+    if (!ch.senderIsBot && userId) noteHumanParticipant(ch.channelId, { id: userId, name: userName, email: payload.sender?.email ?? payload.user?.email });
     if (isMessageOp) recordChannelHistory(ch.channelId, ch.senderIsBot ? `${userName} (agent)` : userName, messageText);
 
     // Roster ops (added/removed) carry no message to answer — the roster is now

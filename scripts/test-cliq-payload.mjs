@@ -40,13 +40,23 @@ const ok = (msg) => { passed++; console.log(`  ✓ ${msg}`); };
  */
 function decide(payload, botUniqueName, requireMention) {
   const messageText = extractMessageText(payload);
+  // Mirror the handler's identity resolution: bot id is the only hard
+  // requirement; sender id is optional and defaults to "" (NEO-206).
+  const botId = payload.bot_unique_name ?? payload.bot?.unique_name;
+  const userId = payload.sender?.id ?? payload.user?.id ?? "";
   const { operation, isMessageOp, isSilent } = resolveOperation(payload);
   const { repliedText, files, reactions } = extractCliqContext(payload);
-  const ch = extractChannelContext(payload, payload.chat?.id, payload.sender?.id);
+  const ch = extractChannelContext(payload, payload.chat?.id, userId);
 
+  if (!botId) return { dispatched: false, reason: "no bot id", messageText, ch, operation };
   if (isSilent) return { dispatched: false, reason: "silent op", messageText, ch, operation };
   if (isMessageOp && !messageText.trim() && files.length === 0 && !repliedText && reactions.length === 0) {
     return { dispatched: false, reason: "empty message", messageText, ch, operation };
+  }
+  // DM with no sender id cannot be answered; a channel routes on the chat id and
+  // proceeds without one (the regression that dropped every channel message).
+  if (!ch.isChannel && !userId) {
+    return { dispatched: false, reason: "dm no sender", messageText, ch, operation };
   }
   if (ch.isChannel && isMessageOp && requireMention && !botWasMentioned(ch.mentions, botUniqueName, messageText)) {
     return { dispatched: false, reason: "not mentioned", messageText, ch, operation };
@@ -91,6 +101,17 @@ function main() {
   assert.equal(c3.reason, "not mentioned");
   ok("channel: unmentioned bot is correctly gated out");
 
+  // ─── 2b. Channel message with NO sender id still dispatches (NEO-206) ──────
+  // The participation Deluge script can post without `sender.id`; the old
+  // working monitor tolerated this, the ported handler wrongly required it and
+  // silently dropped every channel message (mention or not). Regression guard.
+  const noSender = structuredClone(channel);
+  delete noSender.sender;
+  const cNoSender = decide(noSender, "marc", true);
+  assert.equal(cNoSender.ch.isChannel, true);
+  assert.equal(cNoSender.dispatched, true, `channel w/o sender id expected dispatch, got: ${cNoSender.reason}`);
+  ok("channel: message with no sender id still dispatches (was silently dropped)");
+
   // ─── 3. groupchat chat.type also counts as a channel ──────────────────────
   const groupchat = structuredClone(channel);
   groupchat.chat.type = "groupchat";
@@ -121,6 +142,16 @@ function main() {
   assert.equal(d.operation, "message_sent"); // default for the legacy handler
   assert.equal(d.dispatched, true, `DM expected dispatch, got: ${d.reason}`);
   ok("DM: top-level message parses, not a channel, reaches dispatch (regression)");
+
+  // A DM with no sender id cannot be answered → correctly dropped (the guard
+  // that, mis-applied to channels, caused NEO-206).
+  const dmNoSender = structuredClone(dm);
+  delete dmNoSender.sender;
+  delete dmNoSender.user;
+  const dn = decide(dmNoSender, "marc", true);
+  assert.equal(dn.dispatched, false);
+  assert.equal(dn.reason, "dm no sender");
+  ok("DM: no sender id is dropped (cannot route a reply), unlike a channel");
 
   console.log(`\n✅ test-cliq-payload: ${passed} assertions passed`);
 }
