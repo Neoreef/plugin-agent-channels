@@ -412,10 +412,15 @@ export async function sendCliqChatMessage(
   ctx: PluginContext,
   chatId: string,
   text: string,
-  opts?: { buttons?: CliqButton[]; companyId?: string; serviceId?: string },
+  opts?: { buttons?: CliqButton[]; companyId?: string; serviceId?: string; bot?: { name: string; image?: string } },
 ): Promise<{ status: number; ref: CliqMessageRef }> {
   const body: Record<string, unknown> = { text: markdownToCliq(text), sync_message: true };
   if (opts?.buttons && opts.buttons.length > 0) body.buttons = opts.buttons;
+  // Attribute the message to the posting bot. Posting to /chats/{id}/message via
+  // the shared company connection otherwise renders every agent's reply with the
+  // same anonymous integration identity — in a multi-bot channel you can't tell
+  // who answered. The `bot` persona field sets the displayed name/avatar.
+  if (opts?.bot?.name) body.bot = opts.bot;
 
   const result = await cliqFetch(ctx, "POST", `/chats/${encodeURIComponent(chatId)}/message`, body, {
     companyId: opts?.companyId,

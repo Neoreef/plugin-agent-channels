@@ -450,6 +450,7 @@ export async function handleCliqWebhook(
     convKey,
     chatId,
     botUniqueName,
+    botDisplayName,
     userId,
     userName,
     agentId,
@@ -472,6 +473,8 @@ type BackgroundChatArgs = {
   convKey: string;
   chatId: string | undefined;
   botUniqueName: string;
+  /** Bot display name for channel-reply attribution (falls back to unique name). */
+  botDisplayName?: string;
   userId: string;
   userName: string;
   agentId: string;
@@ -599,7 +602,9 @@ async function runChatInBackground(
       logDone(ctx, agentId, result);
       await saveSession(ctx, convKey, result.sessionId);
       const finalText = finalTextOf(result);
-      if (chatId) await sendCliqChatMessage(ctx, chatId, finalText, { companyId });
+      // Attribute the channel reply to this bot so participants see who answered.
+      const botPersona = { name: args.botDisplayName || botUniqueName };
+      if (chatId) await sendCliqChatMessage(ctx, chatId, finalText, { companyId, bot: botPersona });
       else await sendCliqMessage(ctx, botUniqueName, userId, finalText, undefined, { companyId }); // fallback
       // Buffer our own reply for channel context + count it against the flywheel.
       recordChannelHistory(ch.channelId, `${botUniqueName} (agent)`, result.text);
