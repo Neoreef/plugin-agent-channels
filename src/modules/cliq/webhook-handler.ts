@@ -13,6 +13,7 @@ import { resolveBot } from "./bot-mapping.js";
 import {
   sendCliqMessage,
   sendCliqChatMessage,
+  sendCliqChannelMessage,
   getChatEditCapability,
   setChatEditCapability,
   downloadCliqFile,
@@ -65,6 +66,13 @@ const activeQueries = new Map<string, ActiveQuery>();
 
 /** Channels we've already emitted the one-time payload-shape probe for. */
 const loggedChannelProbe = new Set<string>();
+
+/** chatId → channel unique_name. Only ParticipationHandler payloads carry
+ *  `chat.channel_unique_name`; the MentionHandler payload (which triggers the
+ *  actual reply) does not. We cache it from every channel payload that has it so
+ *  the reply can post via the bot-attributed `/channelsbyname` endpoint even
+ *  when the triggering payload lacked the name (NEO-206). */
+const channelUniqueNameByChatId = new Map<string, string>();
 
 /**
  * Sanitize Cliq webhook payload.
@@ -361,6 +369,11 @@ export async function handleCliqWebhook(
   let rosterContext: string | undefined;
   let channelGuidance: string | undefined;
   if (ch.isChannel) {
+    // Cache the channel unique_name (only participation payloads carry it) so a
+    // later mention-triggered reply can post via the bot-attributed endpoint.
+    const uname = payload.chat?.channel_unique_name || ch.channelName;
+    if (chatId && uname) channelUniqueNameByChatId.set(chatId, uname);
+
     // One-time per-channel probe to confirm the payload shape in prod (which
     // fields actually arrive) without spamming the log on every message.
     if (!loggedChannelProbe.has(ch.channelId)) {
@@ -461,7 +474,15 @@ export async function handleCliqWebhook(
     files,
     reactions,
     channel: ch.isChannel
-      ? { channelId: ch.channelId, channelName: ch.channelName, channelLabel: ch.channelLabel, rosterContext, channelGuidance }
+      ? {
+          channelId: ch.channelId,
+          // Prefer the cached unique_name so a mention reply (whose payload lacks
+          // it) can still post via the bot-attributed /channelsbyname endpoint.
+          channelName: ch.channelName || (chatId ? channelUniqueNameByChatId.get(chatId) ?? "" : ""),
+          channelLabel: ch.channelLabel,
+          rosterContext,
+          channelGuidance,
+        }
       : undefined,
   }).catch((err) => {
     ctx.logger.error(`Cliq background chat crashed: ${String(err)}`);
@@ -602,10 +623,23 @@ async function runChatInBackground(
       logDone(ctx, agentId, result);
       await saveSession(ctx, convKey, result.sessionId);
       const finalText = finalTextOf(result);
-      // Attribute the channel reply to this bot so participants see who answered.
-      const botPersona = { name: args.botDisplayName || botUniqueName };
-      if (chatId) await sendCliqChatMessage(ctx, chatId, finalText, { companyId, bot: botPersona });
-      else await sendCliqMessage(ctx, botUniqueName, userId, finalText, undefined, { companyId }); // fallback
+      // Deliver the reply attributed to THIS bot so participants see who
+      // answered. The /chats/{id}/message endpoint renders every bot's reply as
+      // the same anonymous shared-connection sender (the `bot` body field does
+      // not override it), so prefer /channelsbyname/{name}?bot_unique_name when
+      // we know the channel name; fall back to the chat id otherwise.
+      // Resolve at SEND time: the participation message that carries the
+      // unique_name may land just after this mention POST, so the cache is more
+      // likely populated now (post agent-turn) than at dispatch.
+      const channelName = ch?.channelName || (chatId ? channelUniqueNameByChatId.get(chatId) : undefined);
+      if (channelName) {
+        await sendCliqChannelMessage(ctx, channelName, botUniqueName, finalText, { companyId });
+      } else if (chatId) {
+        ctx.logger.info(`Cliq channel reply: no channel unique_name for chat ${chatId}, posting unattributed`);
+        await sendCliqChatMessage(ctx, chatId, finalText, { companyId, bot: { name: args.botDisplayName || botUniqueName } });
+      } else {
+        await sendCliqMessage(ctx, botUniqueName, userId, finalText, undefined, { companyId }); // last-resort DM
+      }
       // Buffer our own reply for channel context + count it against the flywheel.
       recordChannelHistory(ch.channelId, `${botUniqueName} (agent)`, result.text);
       recordAgentMessage(agentId, ch.channelId);

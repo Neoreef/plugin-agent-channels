@@ -430,6 +430,36 @@ export async function sendCliqChatMessage(
   return { status: result.status, ref: { chatId, messageId } };
 }
 
+/**
+ * Post into a channel **as a specific bot**, by channel unique name. Unlike
+ * `/chats/{chatId}/message` (which renders every reply with the same anonymous
+ * shared-connection sender), `/channelsbyname/{name}/message?bot_unique_name=…`
+ * attributes the message to the bot's real registered identity (name + avatar)
+ * — so participants can tell which agent answered (NEO-206). Mirrors the old
+ * OpenClaw plugin's channel send.
+ */
+export async function sendCliqChannelMessage(
+  ctx: PluginContext,
+  channelName: string,
+  botName: string,
+  text: string,
+  opts?: { buttons?: CliqButton[]; companyId?: string; serviceId?: string },
+): Promise<{ status: number; ref: CliqMessageRef }> {
+  const body: Record<string, unknown> = { text: markdownToCliq(text), sync_message: true };
+  if (opts?.buttons && opts.buttons.length > 0) body.buttons = opts.buttons;
+
+  const path = `/channelsbyname/${encodeURIComponent(channelName)}/message?bot_unique_name=${encodeURIComponent(botName)}`;
+  const result = await cliqFetch(ctx, "POST", path, body, {
+    companyId: opts?.companyId,
+    serviceId: opts?.serviceId,
+  });
+  if (!result.status || result.status >= 400) {
+    ctx.logger.error(`Cliq channel send failed (${result.status}) for #${channelName}: ${JSON.stringify(result.data).slice(0, 200)}`);
+  }
+  const messageId = (result.data as { message_id?: string } | undefined)?.message_id;
+  return { status: result.status, ref: { messageId } };
+}
+
 // ─── Edit message ────────────────────────────────────────────────────────────
 
 export async function editCliqMessage(
