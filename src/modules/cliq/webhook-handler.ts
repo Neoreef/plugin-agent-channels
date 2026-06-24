@@ -23,8 +23,9 @@ import {
 import { runAgentChat, type HarnessEvent } from "../../lib/harness.js";
 import { createCliqDraftStream } from "../../lib/draft-stream.js";
 import {
-  getResumeSession,
+  resolveSession,
   saveSession,
+  policyFingerprint,
   dmConversationKey,
   channelConversationKey,
 } from "./session-store.js";
@@ -69,6 +70,10 @@ const activeQueries = new Map<string, ActiveQuery>();
 
 /** Channels we've already emitted the one-time payload-shape probe for. */
 const loggedChannelProbe = new Set<string>();
+
+/** `channelId:fingerprint` we've already posted a policy-change warning for, so
+ *  a settings change warns the channel once, not once per agent (NEO-209). */
+const warnedPolicyChange = new Set<string>();
 
 /** Capitalize the first letter (for the channel-reply sender-name prefix). */
 function capitalize(s: string): string {
@@ -579,8 +584,21 @@ async function runChatInBackground(
   const editable = chatId ? getChatEditCapability(chatId) : null;
 
   // Resume this conversation's prior session for multi-turn memory (per channel
-  // for groups, per user for DMs).
-  const resumeSessionId = await getResumeSession(ctx, convKey);
+  // for groups, per user for DMs). The static channel guidance (broadcast
+  // self-selection + channelGuidance) is baked into the session system prompt at
+  // creation, so a changed policy fingerprint resets the session (and warns the
+  // channel once) rather than re-injecting it every turn (NEO-209).
+  const fingerprint = ch ? policyFingerprint({ broadcast: ch.broadcast, channelGuidance: ch.channelGuidance }) : undefined;
+  const { resumeSessionId, resetReason } = await resolveSession(ctx, convKey, fingerprint);
+  const freshSession = !resumeSessionId; // new session or a policy-triggered reset
+  if (resetReason === "policy_changed" && ch) {
+    ctx.logger.info(`Cliq channel ${ch.channelLabel}: policy changed, resetting ${botUniqueName} session`);
+    const warnKey = `${ch.channelId}:${fingerprint}`;
+    if (chatId && !warnedPolicyChange.has(warnKey)) {
+      warnedPolicyChange.add(warnKey);
+      await sendCliqChatMessage(ctx, chatId, `_(Channel policy updated — agents are starting fresh conversations.)_`, { companyId }).catch(() => {});
+    }
+  }
 
   // Honcho memory scope — group-aware: a channel-keyed multi-peer session whose
   // peers are all known participants; a per-(user,agent) session for DMs.
@@ -600,16 +618,21 @@ async function runChatInBackground(
   // Plugin-recall about the current speaker. Combined with channel guidance,
   // the roster, and recent channel history into the system-level context.
   const honchoRecallText = honchoScope ? (await honchoRecall(ctx, honchoScope, messageText)) ?? undefined : undefined;
+  // Static channel guidance (broadcast self-selection + channelGuidance) is sent
+  // ONLY when the session is created — the harness persists it as the session
+  // system prompt, so re-sending each turn would just burn tokens × agents ×
+  // messages (NEO-209, board feedback). Roster, channel history, and Honcho
+  // recall are genuinely per-turn and always included.
+  const sessionGuidance = freshSession
+    ? [ch?.broadcast ? broadcastSelfSelectGuidance() : undefined, ch?.channelGuidance]
+    : [];
   const memoryContext = [
-    // Broadcast self-selection leads the context so the agent decides up front
-    // whether to speak or emit the silent token (NEO-209).
-    ch?.broadcast ? broadcastSelfSelectGuidance() : undefined,
-    ch?.channelGuidance,
+    ...sessionGuidance,
     ch?.rosterContext,
     ch ? renderChannelHistory(ch.channelId) : undefined,
     honchoRecallText,
   ].filter((s) => s && s.trim()).join("\n\n") || undefined;
-  if (memoryContext) ctx.logger.info(`Context injected: ${memoryContext.length} chars${ch ? " (channel)" : ""}`);
+  if (memoryContext) ctx.logger.info(`Context injected: ${memoryContext.length} chars${ch ? " (channel)" : ""}${freshSession ? " +session-guidance" : ""}`);
 
   // Enrich the prompt with reply context + downloaded attachments + reactions
   // (#28/#29/#30). In channels the message is sender-attributed ("Name: text");
@@ -634,7 +657,9 @@ async function runChatInBackground(
         memoryContext,
       });
       logDone(ctx, agentId, result);
-      await saveSession(ctx, convKey, result.sessionId);
+      // Persist the policy fingerprint so a later settings change resets this
+      // session (and the new system prompt takes effect) — NEO-209.
+      await saveSession(ctx, convKey, result.sessionId, fingerprint);
       // Broadcast self-selection: an agent with nothing to add replies with just
       // the silent token (or an empty turn). Suppress delivery so lurking agents
       // stay quiet — the inbound message is already buffered for their context

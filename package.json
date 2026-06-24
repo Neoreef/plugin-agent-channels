@@ -16,7 +16,7 @@
     "build": "tsc -p ./tsconfig.json && node ./scripts/build-ui.mjs",
     "clean": "rm -rf dist",
     "typecheck": "tsc --noEmit -p ./tsconfig.json",
-    "test": "npm run build && node ./scripts/test-per-company.mjs && node ./scripts/test-worker-multitenancy.mjs && node ./scripts/test-connection-store.mjs && node ./scripts/test-cliq-payload.mjs && node ./scripts/test-silent-reply.mjs"
+    "test": "npm run build && node ./scripts/test-per-company.mjs && node ./scripts/test-worker-multitenancy.mjs && node ./scripts/test-connection-store.mjs && node ./scripts/test-cliq-payload.mjs && node ./scripts/test-silent-reply.mjs && node ./scripts/test-session-policy.mjs"
   },
   "dependencies": {
     "@paperclipai/plugin-sdk": "*",
