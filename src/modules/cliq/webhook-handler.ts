@@ -13,6 +13,7 @@ import { resolveBot } from "./bot-mapping.js";
 import {
   sendCliqMessage,
   sendCliqChatMessage,
+  sendCliqChannelMessage,
   getChatEditCapability,
   setChatEditCapability,
   downloadCliqFile,
@@ -71,6 +72,12 @@ const loggedChannelProbe = new Set<string>();
 function capitalize(s: string): string {
   return s ? s.charAt(0).toUpperCase() + s.slice(1) : s;
 }
+
+/** chatId → channel unique_name. The MentionHandler payload (which triggers the
+ *  reply) lacks `chat.channel_unique_name`; only ParticipationHandler payloads
+ *  carry it. Cache it so a mention reply can post via the bot-attributed
+ *  `/channelsbyname` endpoint (NEO-206). */
+const channelUniqueNameByChatId = new Map<string, string>();
 
 /**
  * Sanitize Cliq webhook payload.
@@ -367,6 +374,11 @@ export async function handleCliqWebhook(
   let rosterContext: string | undefined;
   let channelGuidance: string | undefined;
   if (ch.isChannel) {
+    // Cache the channel unique_name (participation payloads have it; the mention
+    // payload that triggers the reply does not) for the attributed send.
+    const uname = payload.chat?.channel_unique_name || ch.channelName;
+    if (chatId && uname) channelUniqueNameByChatId.set(chatId, uname);
+
     // One-time per-channel probe to confirm the payload shape in prod (which
     // fields actually arrive) without spamming the log on every message.
     if (!loggedChannelProbe.has(ch.channelId)) {
@@ -611,17 +623,23 @@ async function runChatInBackground(
       logDone(ctx, agentId, result);
       await saveSession(ctx, convKey, result.sessionId);
       const finalText = finalTextOf(result);
-      // Attribute the reply to THIS bot so participants can tell who answered.
-      // Neither native path works for these bots: /chats/{id}/message posts as
-      // the anonymous shared connection (the `bot` body field doesn't override
-      // it), and the bot-attributed /channelsbyname endpoint 400s with
-      // "bot_not_member" — the org-level bots receive via Deluge handler
-      // subscriptions, not channel membership. So prefix the sender name; this
-      // posts reliably via the chat id and clearly shows the author.
+      // Prefer NATIVE attribution: post as the bot via /channelsbyname so the
+      // reply shows the bot's real name + avatar (the bots ARE channel members —
+      // confirmed via the members API). The mention payload lacks the channel
+      // unique_name, so fall back to the cached one. If that send fails (e.g. a
+      // bot that isn't a member), fall back to a name-prefixed chat-id post so a
+      // reply still lands and still shows who answered.
+      const channelName = ch?.channelName || (chatId ? channelUniqueNameByChatId.get(chatId) : undefined);
       const senderName = capitalize(args.botDisplayName || botUniqueName);
-      const attributed = `**${senderName}**\n${finalText}`;
-      if (chatId) await sendCliqChatMessage(ctx, chatId, attributed, { companyId });
-      else await sendCliqMessage(ctx, botUniqueName, userId, finalText, undefined, { companyId }); // last-resort DM
+      let nativeOk = false;
+      if (channelName) {
+        const r = await sendCliqChannelMessage(ctx, channelName, botUniqueName, finalText, { companyId });
+        nativeOk = r.status >= 200 && r.status < 300;
+      }
+      if (!nativeOk) {
+        if (chatId) await sendCliqChatMessage(ctx, chatId, `**${senderName}**\n${finalText}`, { companyId });
+        else await sendCliqMessage(ctx, botUniqueName, userId, finalText, undefined, { companyId }); // last-resort DM
+      }
       // Buffer our own reply for channel context + count it against the flywheel.
       recordChannelHistory(ch.channelId, `${botUniqueName} (agent)`, result.text);
       recordAgentMessage(agentId, ch.channelId);

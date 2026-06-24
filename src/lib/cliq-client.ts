@@ -454,7 +454,12 @@ export async function logCliqChannelDiagnostics(
     );
     if (channelId) {
       const mRes = await cliqFetch(ctx, "GET", `/channels/${encodeURIComponent(channelId)}/members`, undefined, scope);
-      ctx.logger.info(`Cliq diag members: status=${mRes.status} raw=${JSON.stringify(mRes.data).slice(0, 600)}`);
+      const mroot = (mRes.data ?? {}) as Record<string, unknown>;
+      const members = (Array.isArray(mroot.members) ? mroot.members : []) as Array<Record<string, unknown>>;
+      const bots = members
+        .filter((m) => m?.user_role === "bot" || m?.bot_unique_name)
+        .map((m) => `${m.bot_unique_name ?? "?"}(${m.name ?? "?"})`);
+      ctx.logger.info(`Cliq diag bots in #${(ch?.unique_name as string) ?? "-"} (status=${mRes.status}, ${members.length} members): ${bots.join(", ")}`);
     }
   } catch (e) {
     ctx.logger.info(`Cliq diag failed for chat ${chatId}: ${String(e)}`);
