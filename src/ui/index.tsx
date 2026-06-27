@@ -6,6 +6,15 @@ import {
 } from "@paperclipai/plugin-sdk/ui";
 import { CLIQ_SCOPES } from "../constants.js";
 
+// ─── Host derivation ─────────────────────────────────────────────────────────
+// Derive callback/webhook URLs from the host actually serving this UI, so the
+// plugin works unchanged on live (cortex.neoreef.com) and beta
+// (cortex-beta.neoreef.com). Falls back to the live host when there is no
+// window (e.g. SSR).
+function originBase(): string {
+  return typeof window !== "undefined" ? window.location.origin : "https://cortex.neoreef.com";
+}
+
 // ─── Styles ─────────────────────────────────────────────────────────────────
 
 const btn: CSSProperties = {
@@ -190,7 +199,7 @@ function OAuthSetup({ serviceId, serviceDef, companyId }: { serviceId: string; s
 
   const [clientId, setClientId] = useState("");
   const [clientSecret, setClientSecret] = useState("");
-  const [callbackUrl, setCallbackUrl] = useState("https://cortex.neoreef.com/oauth/callback");
+  const [callbackUrl, setCallbackUrl] = useState(`${originBase()}/oauth/callback`);
   const [dataCenter, setDataCenter] = useState("US");
   const [configSaved, setConfigSaved] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -301,9 +310,7 @@ function OAuthSetup({ serviceId, serviceDef, companyId }: { serviceId: string; s
 
 // ─── Deluge Script Templates ────────────────────────────────────────────────
 
-const WEBHOOK_URL = "https://cortex.neoreef.com/cliq";
-
-function delugeMessageHandler(botName: string): string {
+function delugeMessageHandler(botName: string, webhookUrl: string): string {
   return `bot_name = "${botName}";
 recent_messages = chat.get("recent_messages");
 if(!isnull(recent_messages))
@@ -347,7 +354,7 @@ payload = {"bot_unique_name":bot_name,"user":user,"message":message.toString(),"
 headers = {"Content-Type":"application/json"};
 try
 {
-\tresponse = postUrl("${WEBHOOK_URL}",payload.toString(),headers,false);
+\tresponse = postUrl("${webhookUrl}",payload.toString(),headers,false);
 \treturn {"status":"success","text":"Processing..."};
 }
 catch (e)
@@ -356,7 +363,7 @@ catch (e)
 }`;
 }
 
-function delugeMentionHandler(botName: string): string {
+function delugeMentionHandler(botName: string, webhookUrl: string): string {
   return `bot_name = "${botName}";
 recent_messages = chat.get("recent_messages");
 if(!isnull(recent_messages))
@@ -393,7 +400,7 @@ payload = {"bot_unique_name":bot_name,"user":user,"message":message.toString(),"
 headers = {"Content-Type":"application/json"};
 try
 {
-\tresponse = postUrl("${WEBHOOK_URL}",payload.toString(),headers,false);
+\tresponse = postUrl("${webhookUrl}",payload.toString(),headers,false);
 \treturn {"type":"banner","status":"success","text":"Processing..."};
 }
 catch (e)
@@ -402,7 +409,7 @@ catch (e)
 }`;
 }
 
-function delugeParticipationHandler(botName: string): string {
+function delugeParticipationHandler(botName: string, webhookUrl: string): string {
   return `bot_name = "${botName}";
 if(!isnull(data))
 {
@@ -426,7 +433,7 @@ payload = {"bot_unique_name":bot_name,"operation":operation,"data":data,"user":u
 headers = {"Content-Type":"application/json"};
 try
 {
-\tresponse = postUrl("${WEBHOOK_URL}",payload.toString(),headers,false);
+\tresponse = postUrl("${webhookUrl}",payload.toString(),headers,false);
 \treturn {"type":"banner","status":"success","text":"Processing..."};
 }
 catch (e)
@@ -435,7 +442,7 @@ catch (e)
 }`;
 }
 
-function delugeButtonCallback(): string {
+function delugeButtonCallback(webhookUrl: string): string {
   return `response = Map();
 button_key = "";
 bot_name = "";
@@ -467,7 +474,7 @@ try
 {
 \tresp = invokeurl
 \t[
-\t\turl :"${WEBHOOK_URL}"
+\t\turl :"${webhookUrl}"
 \t\ttype :POST
 \t\tparameters:payload.toString()
 \t\theaders:{"Content-Type":"application/json"}
@@ -534,18 +541,19 @@ function ScriptBlock({ title, script, description }: { title: string; script: st
 // ─── Inline Bot Setup Scripts (shown in the add-mapping form) ───────────────
 
 function InlineBotSetup({ botName }: { botName: string }) {
+  const webhookUrl = `${originBase()}/cliq`;
   return (
     <div style={{ marginTop: "0.75rem", paddingTop: "0.75rem", borderTop: "1px solid var(--border)" }}>
       <p style={{ fontSize: "12px", margin: "0 0 0.5rem 0" }}>
         <strong>Bot Handlers</strong> — paste into your Cliq bot's handler config for <code>{botName}</code>:
       </p>
-      <ScriptBlock title="message_handler" description="DM messages" script={delugeMessageHandler(botName)} />
-      <ScriptBlock title="mention_handler" description="@mentions in channels" script={delugeMentionHandler(botName)} />
-      <ScriptBlock title="participation_handler" description="Join/leave events" script={delugeParticipationHandler(botName)} />
+      <ScriptBlock title="message_handler" description="DM messages" script={delugeMessageHandler(botName, webhookUrl)} />
+      <ScriptBlock title="mention_handler" description="@mentions in channels" script={delugeMentionHandler(botName, webhookUrl)} />
+      <ScriptBlock title="participation_handler" description="Join/leave events" script={delugeParticipationHandler(botName, webhookUrl)} />
       <p style={{ fontSize: "12px", margin: "0.75rem 0 0.5rem 0" }}>
         <strong>Button Callback</strong> — create in <em>Bots & Tools → Functions</em> as <code>agentChannelsCallback</code> (Button Function):
       </p>
-      <ScriptBlock title="agentChannelsCallback" description="Stop button, etc." script={delugeButtonCallback()} />
+      <ScriptBlock title="agentChannelsCallback" description="Stop button, etc." script={delugeButtonCallback(webhookUrl)} />
     </div>
   );
 }

@@ -102,9 +102,13 @@ assert_grep 'registerChannel\(cliqChannel\)'      src/channels.ts          "cliq
 # Check 5 — state.pluginId includes 'agent-channels' in the connect-URL builder.
 assert_grep 'pluginId:[[:space:]]*"agent-channels"' src/worker.ts "connect-url builder embeds state.pluginId = 'agent-channels'"
 
-# Supporting — default callback + Cliq webhook URLs match the deployment.
-assert_grep "$(printf '%s' "$EXPECTED_CALLBACK_URL" | sed 's/[.[\*^$/]/\\&/g')" src/ui/index.tsx "UI default callback URL is ${EXPECTED_CALLBACK_URL}"
-assert_grep "$(printf '%s' "$EXPECTED_CLIQ_URL" | sed 's/[.[\*^$/]/\\&/g')"     src/ui/index.tsx "UI Cliq webhook URL is ${EXPECTED_CLIQ_URL}"
+# Supporting — callback + Cliq webhook URLs are host-agnostic (NEO-273): the UI
+# derives both from window.location.origin so it serves the correct host on live
+# AND beta, rather than hardcoding the live host. The actual per-host URLs are
+# verified against the deployment by the LIVE HTTP probes below.
+assert_grep 'window\.location\.origin' src/ui/index.tsx "UI derives URLs from window.location.origin (host-agnostic)"
+assert_grep 'originBase\(\)\}/oauth/callback' src/ui/index.tsx "UI default callback URL derived from origin (\${origin}/oauth/callback)"
+assert_grep 'originBase\(\)\}/cliq'           src/ui/index.tsx "UI Cliq webhook URL derived from origin (\${origin}/cliq)"
 
 # ─────────────────────────────────────────────────────────────────────────────
 section "LIVE checks (HTTP probes against ${BASE_URL})"
@@ -117,10 +121,14 @@ HTTP_ATTEMPTS="${SMOKE_HTTP_ATTEMPTS:-3}"
 http_status() {
   # http_status <method> <url> [data] — returns the first 200, else the last code.
   local method="$1" url="$2" data="${3:-}" code="" i=1
+  # Default to an empty JSON object. Note: do NOT inline this as "${data:-{}}" —
+  # that ${var:-{}} expansion leaves a stray trailing '}', sending malformed JSON
+  # like {"smoke":"test"}} which a strict /cliq handler rejects with HTTP 500.
+  [ -n "$data" ] || data='{}'
   while [ "$i" -le "$HTTP_ATTEMPTS" ]; do
     if [ "$method" = "POST" ]; then
       code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 15 \
-        -X POST -H 'Content-Type: application/json' --data "${data:-{}}" "$url" 2>/dev/null)"
+        -X POST -H 'Content-Type: application/json' --data "$data" "$url" 2>/dev/null)"
     else
       code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 15 "$url" 2>/dev/null)"
     fi
