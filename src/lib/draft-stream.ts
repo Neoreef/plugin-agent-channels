@@ -76,6 +76,11 @@ export function createCliqDraftStream(params: DraftStreamParams): CliqDraftStrea
   const finalisedRefs: CliqMessageRef[] = [];
   let editDisabled = false;
   let finalizing = false;
+  // Set when a send succeeds but returns no editable message ref (no messageId).
+  // We can't edit in place, so we stop streaming intermediate chunks (which would
+  // post as separate fresh messages) and let the final flush deliver the whole
+  // answer as a single message instead — "send final once" (NEO-275).
+  let streamingUnsupported = false;
 
   let editCount = 0;
   const streamStartTime = Date.now();
@@ -237,14 +242,24 @@ export function createCliqDraftStream(params: DraftStreamParams): CliqDraftStrea
 
       didSend = true;
 
-      if (result.ref.chatId && result.ref.messageId) {
-        currentRef = result.ref;
+      // The chat send doesn't always echo chat_id (it's in the URL); fall back to
+      // the chat we're posting into so the ref is editable (NEO-275).
+      const chatId = result.ref.chatId ?? params.chatId;
+      if (chatId && result.ref.messageId) {
+        currentRef = { chatId, messageId: result.ref.messageId };
         lastSentText = text.trimEnd();
         return true;
       }
 
-      ctx.logger.error("draft-stream: sent but no ref returned");
-      finalisedCharCount += text.length;
+      // No editable ref (this send path can't be edited in place). Degrade to
+      // "send final once": suppress further per-chunk sends and let the final
+      // flush post the complete answer as a single message, instead of spraying
+      // each chunk as a fresh message (NEO-275).
+      ctx.logger.warn(
+        `draft-stream: sent but no editable ref (status ${result.status}, ref=${JSON.stringify(result.ref)}) — degrading to send-final-once`,
+      );
+      streamingUnsupported = true;
+      finalisedCharCount = 0;
       currentRef = null;
       return true;
     } catch (err) {
@@ -256,6 +271,10 @@ export function createCliqDraftStream(params: DraftStreamParams): CliqDraftStrea
   async function doSendOrEdit(text: string): Promise<boolean> {
     const trimmed = text.trimEnd();
     editCount++;
+
+    // In send-final-once mode we have no editable ref: skip intermediate updates
+    // and only emit on the final flush, so the answer lands as one message.
+    if (streamingUnsupported && !finalizing) return true;
 
     try {
       if (currentRef?.chatId && currentRef?.messageId && !editDisabled) {

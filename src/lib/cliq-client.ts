@@ -291,6 +291,20 @@ function decodeId(v: unknown): string | undefined {
   try { return decodeURIComponent(v); } catch { return v; }
 }
 
+/**
+ * Resolve a complete, editable message ref from a send response. Extracts the
+ * ids Cliq echoes, then re-attaches the chat id we already know when the body
+ * omitted it — a POST to /chats/{chatId}/message returns the message_id but no
+ * chat_id (it's in the URL), so without this the draft stream gets a ref with no
+ * chatId, can't edit in place, and posts every chunk as a fresh message
+ * (NEO-275). Pure so it can be unit-tested against captured response shapes.
+ */
+export function resolveCardMessageRef(data: unknown, userId: string, knownChatId?: string): CliqMessageRef {
+  const ref = extractBotDmMessageRef(data, userId);
+  if (knownChatId && !ref.chatId) ref.chatId = knownChatId;
+  return ref;
+}
+
 function extractBotDmMessageRef(data: unknown, userId: string): CliqMessageRef {
   const root = ((data as any)?.data ?? data) as any;
   const md = root?.message_details;
@@ -398,7 +412,15 @@ export async function sendCliqCardMessage(
     companyId: opts?.companyId,
     serviceId: opts?.serviceId,
   });
-  return { status: result.status, ref: extractBotDmMessageRef(result.data, userId) };
+  const ref = resolveCardMessageRef(result.data, userId, opts?.chatId);
+  if (result.status < 400 && !ref.messageId) {
+    // Send succeeded but no message id came back — capture the raw shape so we
+    // can see why this send path can't be edited in place (NEO-275).
+    ctx.logger.warn(
+      `Cliq card send returned no message_id (status ${result.status}, chat=${opts?.chatId ?? "-"}): ${JSON.stringify(result.data).slice(0, 300)}`,
+    );
+  }
+  return { status: result.status, ref };
 }
 
 // ─── Send into a chat (editable: same endpoint family as edit) ───────────────
