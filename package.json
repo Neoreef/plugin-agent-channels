@@ -5,13 +5,18 @@
   "type": "module",
   "private": false,
   "exports": {
-    ".": "./src/index.ts"
+    ".": "./dist/index.js"
   },
   "paperclipPlugin": {
     "manifest": "./dist/manifest.js",
     "worker": "./dist/worker.js",
     "ui": "./dist/ui/"
   },
+  "files": [
+    "dist",
+    "README.md",
+    "package.json"
+  ],
   "scripts": {
     "build": "tsc -p ./tsconfig.json && node ./scripts/build-ui.mjs",
     "clean": "rm -rf dist",

@@ -1,4 +1,5 @@
 node_modules/
-dist/
+# dist/ is committed at release refs (honcho-shape) so `github:#ref` installs
+# ship built output — the server npm path runs --ignore-scripts (NEO-311).
 *.js.map
 .DS_Store
