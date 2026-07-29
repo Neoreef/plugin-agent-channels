@@ -10,13 +10,23 @@ import {
   definePlugin,
   runWorker,
   type PaperclipPlugin,
+  type PluginApiRequestInput,
+  type PluginApiResponse,
   type PluginContext,
   type PluginHealthDiagnostics,
   type PluginJobContext,
   type PluginWebhookInput,
 } from "@paperclipai/plugin-sdk";
-import { DATA_CENTERS, JOB_KEYS, WEBHOOK_KEYS } from "./constants.js";
+import { API_ROUTE_KEYS, DATA_CENTERS, JOB_KEYS, PLUGIN_ID, WEBHOOK_KEYS } from "./constants.js";
 import type { DataCenterKey } from "./constants.js";
+import {
+  assembleAuthorizeUrl,
+  buildTenantConnectUrl,
+  consumeNonce,
+  getTenantConnectConfig,
+  renderConnectPage,
+  resolveAppOAuthClient,
+} from "./lib/tenant-connect.js";
 import type { ZohoAuthState, BotAgentMapping } from "./lib/types.js";
 import { proactiveServiceTokenRefresh } from "./lib/cliq-client.js";
 import {
@@ -85,21 +95,43 @@ async function handleOAuthCallback(ctx: PluginContext, input: PluginWebhookInput
     return;
   }
 
+  // CSRF: tenant-issued flows (hosted "Connect your org" page, PRE-790) carry a
+  // single-use, company-scoped nonce. Validate + consume it before touching any
+  // credentials. Operator connect URLs omit `src: "tenant"` and are unaffected.
+  if (state.src === "tenant") {
+    const ok = await consumeNonce(ctx, companyId ?? "", serviceId, (state.nonce as string) ?? "");
+    if (!ok) {
+      ctx.logger.error(`OAuth callback: rejected tenant flow — invalid/expired CSRF nonce (service ${serviceId})`);
+      return;
+    }
+  }
+
+  // Resolve OAuth client credentials. Operator connections store them per
+  // service (`save-service-oauth-config`); tenant self-service connections
+  // (PRE-790) never set per-service creds and instead use the shared app-level
+  // client from operator instance config — so fall back to it, mirroring the
+  // token-refresh path in cliq-client.ts.
   const oauthConfig = await getServiceOAuthConfig(ctx, serviceId, companyId);
-  if (!oauthConfig?.clientId || !oauthConfig?.clientSecret) {
+  const appClient = await resolveAppOAuthClient(ctx);
+  const clientId = oauthConfig?.clientId || appClient?.clientId;
+  const clientSecret = oauthConfig?.clientSecret || appClient?.clientSecret;
+  const callbackUrl = oauthConfig?.callbackUrl || appClient?.callbackUrl;
+  if (!clientId || !clientSecret) {
     ctx.logger.error(`OAuth callback: no credentials for service ${serviceId}`);
     return;
   }
 
-  const dc = oauthConfig.dataCenter ?? "US";
+  // Data center: per-service config wins; otherwise the company's tenant-connect
+  // config (which drove the authorize URL) so the token center matches.
+  const dc = oauthConfig?.dataCenter ?? (companyId ? (await getTenantConnectConfig(ctx, companyId)).dataCenter : "US");
   const center = DATA_CENTERS[dc] ?? DATA_CENTERS.US;
 
   const params = new URLSearchParams({
     code,
-    client_id: oauthConfig.clientId,
-    client_secret: oauthConfig.clientSecret,
+    client_id: clientId,
+    client_secret: clientSecret,
     grant_type: "authorization_code",
-    ...(oauthConfig.callbackUrl ? { redirect_uri: oauthConfig.callbackUrl } : {}),
+    ...(callbackUrl ? { redirect_uri: callbackUrl } : {}),
   });
 
   const res = await ctx.http.fetch(`https://${center.accounts}/oauth/v2/token`, {
@@ -242,26 +274,19 @@ const plugin: PaperclipPlugin = definePlugin({
         return { connectUrl: "", configured: false };
       }
 
-      const dc = oauthConfig.dataCenter ?? "US";
-      const center = DATA_CENTERS[dc] ?? DATA_CENTERS.US;
       // Embed companyId (NEO-79 — namespace routing on return) and channelType so
       // the OAuth callback can store the token under the right company and route
       // post-auth setup to the right channel module (see handleOAuthCallback /
-      // ChannelModule.onOAuthComplete).
+      // ChannelModule.onOAuthComplete). URL assembly is shared with the tenant
+      // entrypoint (buildTenantConnectUrl) so the two surfaces cannot drift.
       const channelType = (params.channelType as string | undefined) ?? (await getServiceType(ctx, serviceId, companyId));
-      const state = encodeURIComponent(
-        JSON.stringify({ serviceId, companyId, channelType, pluginId: "agent-channels" }),
-      );
-      const connectUrl = `https://${center.accounts}/oauth/v2/auth?` +
-        new URLSearchParams({
-          client_id: oauthConfig.clientId,
-          response_type: "code",
-          scope: scopes,
-          redirect_uri: oauthConfig.callbackUrl,
-          access_type: "offline",
-          prompt: "consent",
-          state,
-        }).toString();
+      const connectUrl = assembleAuthorizeUrl({
+        dataCenter: oauthConfig.dataCenter ?? "US",
+        clientId: oauthConfig.clientId,
+        callbackUrl: oauthConfig.callbackUrl,
+        scopes,
+        state: { serviceId, companyId, channelType, pluginId: PLUGIN_ID },
+      });
       return { connectUrl, configured: true };
     });
 
@@ -465,6 +490,35 @@ const plugin: PaperclipPlugin = definePlugin({
           (result.note ? `: ${result.note}` : ""),
       );
     }
+  },
+
+  // ─── Scoped API routes ───────────────────────────────────────
+  // Public per-tenant "Connect your org" surface (PRE-790 / PRE-329 T2). The
+  // host mounts this under /api/plugins/agent-channels/api/connect and resolves
+  // `companyId` from the query (manifest `apiRoutes[].companyResolution`). A
+  // tenant needs only this link — no operator UI, no operator credentials.
+  async onApiRequest(input: PluginApiRequestInput): Promise<PluginApiResponse> {
+    const ctx = currentContext;
+    if (!ctx) throw new Error("Plugin not initialized");
+
+    if (input.routeKey === API_ROUTE_KEYS.tenantConnect) {
+      const companyId = input.companyId || (typeof input.query.companyId === "string" ? input.query.companyId : "");
+      const channelType = typeof input.query.channelType === "string" ? input.query.channelType : undefined;
+      const result = await buildTenantConnectUrl(ctx, { companyId, channelType, pluginId: PLUGIN_ID });
+      const status = result.configured ? 200 : 409;
+
+      // `?format=json` returns the authorize URL for programmatic callers (e.g.
+      // Caddy landing templating, PRE-789); default serves the hosted HTML page.
+      if (input.query.format === "json") {
+        const body = result.configured
+          ? { configured: true, connectUrl: result.connectUrl, serviceId: result.serviceId, channelType: result.channelType }
+          : { configured: false, reason: result.reason };
+        return { status, headers: { "content-type": "application/json; charset=utf-8" }, body };
+      }
+      return { status, headers: { "content-type": "text/html; charset=utf-8" }, body: renderConnectPage(result) };
+    }
+
+    return { status: 404, headers: { "content-type": "application/json; charset=utf-8" }, body: { error: `Unknown route: ${input.routeKey}` } };
   },
 
   async onShutdown() {

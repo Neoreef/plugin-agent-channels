@@ -20,6 +20,12 @@ export const WEBHOOK_KEYS = {
   mail: "mail-inbound",
 } as const;
 
+/** Scoped JSON/HTML API routes (manifest `apiRoutes`, host-mounted). */
+export const API_ROUTE_KEYS = {
+  /** Public per-tenant "Connect your org" link (PRE-790 / PRE-329 T2). */
+  tenantConnect: "tenant-connect",
+} as const;
+
 /** Zoho data center configuration */
 export const DATA_CENTERS = {
   US: { accounts: "accounts.zoho.com", api: "www.zohoapis.com", cliq: "cliq.zoho.com" },
