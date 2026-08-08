@@ -1,4 +1,4 @@
-import { EXPORT_NAMES, JOB_KEYS, PLUGIN_ID, PLUGIN_VERSION, SLOT_IDS, } from "./constants.js";
+import { API_ROUTE_KEYS, EXPORT_NAMES, JOB_KEYS, PLUGIN_ID, PLUGIN_VERSION, SLOT_IDS, } from "./constants.js";
 const manifest = {
     id: PLUGIN_ID,
     apiVersion: 1,
@@ -24,6 +24,8 @@ const manifest = {
         "secrets.read-ref",
         "instance.settings.register",
         "ui.page.register",
+        // Public per-tenant "Connect your org" route (PRE-790 / PRE-329 T2).
+        "api.routes.register",
         // Grants provider-key env passthrough (ADAPTER_ENV_PASSTHROUGH:
         // ANTHROPIC/OPENAI/GOOGLE/GEMINI/OPENROUTER) into the worker, so the
         // directly-spawned harness inherits the provider credential. We register
@@ -86,6 +88,29 @@ const manifest = {
             endpointKey: "oauth-callback",
             displayName: "OAuth Callback",
             description: "Receives OAuth authorization code from Zoho",
+        },
+        {
+            // Skeleton second channel — reference template for the channel-module
+            // extension pattern (src/modules/mail/, CHANNELS.md). No-op until
+            // implemented; demonstrates registry dispatch without core edits.
+            endpointKey: "mail-inbound",
+            displayName: "Mail Inbound (template)",
+            description: "Skeleton endpoint demonstrating the channel extension pattern",
+        },
+    ],
+    apiRoutes: [
+        {
+            // Per-tenant "Connect your org" link — public (bearer link), companyId
+            // resolved from the query. Serves the hosted connect page / authorize URL
+            // with zero operator-UI access (PRE-790 / PRE-329 T2). CSRF is enforced by
+            // a single-use nonce carried in the OAuth `state` and consumed on callback.
+            routeKey: API_ROUTE_KEYS.tenantConnect,
+            method: "GET",
+            path: "/connect",
+            auth: "webhook",
+            capability: "api.routes.register",
+            checkoutPolicy: "none",
+            companyResolution: { from: "query", key: "companyId" },
         },
     ],
     ui: {

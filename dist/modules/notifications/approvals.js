@@ -18,6 +18,7 @@
 import { sendCliqMessage } from "../../lib/cliq-client.js";
 import { dispatchNotification, getNotifyConfig, ownerPrincipalIds } from "./common.js";
 import { resolvePaperclipUserFromCliq } from "./service-notify.js";
+import { resolveBot } from "../cliq/bot-mapping.js";
 // Must match the Deluge button function name shown in the settings UI guide.
 const BTN_ACTION = { type: "invoke.function", data: { name: "agentChannelsCallback" } };
 /** DM the company's mapped owner users a card when an approval is created. */
@@ -57,15 +58,18 @@ export async function handleApprovalButton(ctx, key, senderZohoId, botName) {
     const approvalId = parts[2];
     if ((action !== "approve" && action !== "reject") || !approvalId)
         return true;
+    // The company that owns this bot — scopes token lookup + notify mapping (NEO-79).
+    const companyId = (await resolveBot(ctx, botName))?.companyId;
+    const scope = { companyId };
     const { apiBase, apiToken } = await getNotifyConfig(ctx);
     if (!apiToken) {
-        await sendCliqMessage(ctx, botName, senderZohoId, "Can't act from Cliq: no Paperclip API token configured.");
+        await sendCliqMessage(ctx, botName, senderZohoId, "Can't act from Cliq: no Paperclip API token configured.", undefined, scope);
         return true;
     }
     // Resolve and authorize the clicker. Only mapped users may act.
-    const pcUser = await resolvePaperclipUserFromCliq(ctx, senderZohoId);
+    const pcUser = await resolvePaperclipUserFromCliq(ctx, senderZohoId, companyId);
     if (!pcUser) {
-        await sendCliqMessage(ctx, botName, senderZohoId, "Your Cliq account isn't mapped to a Paperclip user — cannot record a decision.");
+        await sendCliqMessage(ctx, botName, senderZohoId, "Your Cliq account isn't mapped to a Paperclip user — cannot record a decision.", undefined, scope);
         return true;
     }
     const note = `Decided via Cliq by paperclip:${pcUser} (zoho:${senderZohoId})`;
@@ -76,17 +80,17 @@ export async function handleApprovalButton(ctx, key, senderZohoId, botName) {
             body: JSON.stringify({ decisionNote: note }),
         });
         if (res.ok) {
-            await sendCliqMessage(ctx, botName, senderZohoId, `✅ Approval \`${approvalId}\` ${action === "approve" ? "approved" : "denied"}.`);
+            await sendCliqMessage(ctx, botName, senderZohoId, `✅ Approval \`${approvalId}\` ${action === "approve" ? "approved" : "denied"}.`, undefined, scope);
         }
         else {
             const body = await res.text().catch(() => "");
             ctx.logger.error(`approval ${action} ${approvalId} failed: ${res.status} ${body.slice(0, 200)}`);
-            await sendCliqMessage(ctx, botName, senderZohoId, `❌ Couldn't ${action} \`${approvalId}\` (HTTP ${res.status}).`);
+            await sendCliqMessage(ctx, botName, senderZohoId, `❌ Couldn't ${action} \`${approvalId}\` (HTTP ${res.status}).`, undefined, scope);
         }
     }
     catch (err) {
         ctx.logger.error(`approval ${action} ${approvalId} error: ${String(err)}`);
-        await sendCliqMessage(ctx, botName, senderZohoId, `❌ Error contacting Paperclip: ${String(err).slice(0, 160)}`);
+        await sendCliqMessage(ctx, botName, senderZohoId, `❌ Error contacting Paperclip: ${String(err).slice(0, 160)}`, undefined, scope);
     }
     return true;
 }

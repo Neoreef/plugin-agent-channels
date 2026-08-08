@@ -185,7 +185,7 @@ export async function handleCliqWebhook(ctx, rawBody, parsedBody) {
         if (elapsed < 10 * 60_000) {
             // In a channel, stay quiet (the message is buffered); in a DM, tell the user.
             if (!ch.isChannel) {
-                await sendCliqMessage(ctx, botUniqueName, userId, `I'm still working on your previous request. Please wait for it to finish.`);
+                await sendCliqMessage(ctx, botUniqueName, userId, `I'm still working on your previous request. Please wait for it to finish.`, undefined, { companyId });
             }
             return;
         }
@@ -236,7 +236,7 @@ async function buildTurnContext(ctx, args) {
         if (!f.url)
             continue;
         const isImage = (f.type ?? "").toLowerCase().startsWith("image/");
-        const bytes = await downloadCliqFile(ctx, f.url);
+        const bytes = await downloadCliqFile(ctx, f.url, { companyId: args.companyId });
         if (!bytes) {
             parts.push(`[The user attached "${f.name ?? "a file"}" but it could not be downloaded.]`);
             continue;
@@ -334,9 +334,9 @@ async function runChatInBackground(ctx, args) {
             await saveSession(ctx, convKey, result.sessionId);
             const finalText = finalTextOf(result);
             if (chatId)
-                await sendCliqChatMessage(ctx, chatId, finalText);
+                await sendCliqChatMessage(ctx, chatId, finalText, { companyId });
             else
-                await sendCliqMessage(ctx, botUniqueName, userId, finalText); // fallback
+                await sendCliqMessage(ctx, botUniqueName, userId, finalText, undefined, { companyId }); // fallback
             // Buffer our own reply for channel context + count it against the flywheel.
             recordChannelHistory(ch.channelId, `${botUniqueName} (agent)`, result.text);
             recordAgentMessage(agentId, ch.channelId);
@@ -357,7 +357,7 @@ async function runChatInBackground(ctx, args) {
             });
             logDone(ctx, agentId, result);
             await saveSession(ctx, convKey, result.sessionId);
-            await sendCliqMessage(ctx, botUniqueName, userId, finalTextOf(result));
+            await sendCliqMessage(ctx, botUniqueName, userId, finalTextOf(result), undefined, { companyId });
             if (honchoScope)
                 await recordHonchoTurn(ctx, honchoScope, messageText, result.text);
             return;
@@ -368,6 +368,7 @@ async function runChatInBackground(ctx, args) {
             botName: botUniqueName,
             userId,
             agentName: titleCaseTool(botUniqueName),
+            companyId,
         });
         await stream.setCardState({ kind: "waiting", title: "Waiting" });
         const onEvent = (ev) => {
@@ -417,7 +418,7 @@ async function runChatInBackground(ctx, args) {
             if (cid)
                 setChatEditCapability(cid, false);
             ctx.logger.info(`Cliq edit not supported for chat; sent plain fallback`);
-            await sendCliqMessage(ctx, botUniqueName, userId, finalText);
+            await sendCliqMessage(ctx, botUniqueName, userId, finalText, undefined, { companyId });
         }
         else if (cid) {
             setChatEditCapability(cid, true);
@@ -428,7 +429,7 @@ async function runChatInBackground(ctx, args) {
     }
     catch (err) {
         ctx.logger.error(`Agent invoke failed: ${String(err)}`);
-        await sendCliqMessage(ctx, botUniqueName, userId, `Sorry, I encountered an error: ${String(err).slice(0, 200)}`);
+        await sendCliqMessage(ctx, botUniqueName, userId, `Sorry, I encountered an error: ${String(err).slice(0, 200)}`, undefined, { companyId });
     }
     finally {
         activeQueries.delete(convKey);

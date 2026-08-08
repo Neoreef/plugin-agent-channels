@@ -15,6 +15,8 @@ const STOP_BUTTON_THRESHOLD_MS = 5000;
 // ─── Factory ─────────────────────────────────────────────────────────────────
 export function createCliqDraftStream(params) {
     const { ctx } = params;
+    // Company/service scope so every send/edit/delete uses the right Zoho token.
+    const scope = { companyId: params.companyId, serviceId: params.serviceId };
     let currentRef = params.initialRef ?? null;
     let didSend = !!params.initialRef?.chatId;
     let stopped = false;
@@ -153,6 +155,7 @@ export function createCliqDraftStream(params) {
                     slides: payload.slides,
                     bot: payload.bot,
                     buttons: payload.buttons,
+                    ...scope,
                 });
             }
             catch (err) {
@@ -171,6 +174,7 @@ export function createCliqDraftStream(params) {
                 slides: payload.slides,
                 bot: payload.bot,
                 buttons: payload.buttons,
+                ...scope,
             });
             didSend = true;
             if (result.ref.chatId && result.ref.messageId) {
@@ -200,6 +204,7 @@ export function createCliqDraftStream(params) {
                     bot: payload.bot,
                     buttons: payload.buttons,
                     skipRateLimit: true,
+                    ...scope,
                 });
                 if (result.status === 400 || result.status === 403) {
                     ctx.logger.error(`draft-stream: edit returned ${result.status}`);
@@ -357,7 +362,7 @@ export function createCliqDraftStream(params) {
             animationTimer = null;
         }
         if (currentState.kind !== "message" && currentRef?.chatId && currentRef?.messageId) {
-            deleteCliqMessage(ctx, currentRef.chatId, currentRef.messageId).catch(() => { });
+            deleteCliqMessage(ctx, currentRef.chatId, currentRef.messageId, scope).catch(() => { });
         }
     }
     // Start

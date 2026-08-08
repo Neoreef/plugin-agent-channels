@@ -12,6 +12,12 @@ export declare const JOB_KEYS: {
 export declare const WEBHOOK_KEYS: {
     readonly cliq: "cliq-message";
     readonly oauthCallback: "oauth-callback";
+    readonly mail: "mail-inbound";
+};
+/** Scoped JSON/HTML API routes (manifest `apiRoutes`, host-mounted). */
+export declare const API_ROUTE_KEYS: {
+    /** Public per-tenant "Connect your org" link (PRE-790 / PRE-329 T2). */
+    readonly tenantConnect: "tenant-connect";
 };
 /** Zoho data center configuration */
 export declare const DATA_CENTERS: {
