@@ -451,7 +451,7 @@ export function parseGemini(raw: string): ParsedOutput {
 
 export const HARNESS_REGISTRY: Record<string, HarnessSpec> = {
   hermes_local: {
-    bin: () => binFor("HERMES_BIN", path.join(os.homedir(), ".local", "bin", "hermes")),
+    bin: () => binFor("HERMES_BIN", "hermes"),
     resolveHome: (cfg, companyId) =>
       envHome(cfg, "HOME", "HERMES_HOME") ?? managedCompanyHome(companyId, "hermes-home"),
     homeEnv: (home) => ({ HOME: home, HERMES_HOME: home }),
@@ -595,7 +595,7 @@ function runHermesAcp(cfg: AgentInvokeConfig, opts: RunChatOptions): Promise<Run
   // hermes has no per-turn system flag, so memory recall folds into the prompt.
   const persona = opts.resumeSessionId ? "" : readPersona(cfg.adapterConfig);
   const promptText = composePrompt(persona, opts.prompt, opts.memoryContext);
-  const bin = binFor("HERMES_BIN", path.join(os.homedir(), ".local", "bin", "hermes"));
+  const bin = binFor("HERMES_BIN", "hermes");
   const env: Record<string, string> = {
     ...(process.env as Record<string, string>),
     HOME: home,

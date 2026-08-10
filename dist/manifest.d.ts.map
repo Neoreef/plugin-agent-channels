@@ -1,1 +1,1 @@
-{"version":3,"file":"manifest.d.ts","sourceRoot":"","sources":["../src/manifest.ts"],"names":[],"mappings":"AAAA,OAAO,KAAK,EAAE,yBAAyB,EAAE,MAAM,yBAAyB,CAAC;AAUzE,QAAA,MAAM,QAAQ,EAAE,yBAuGf,CAAC;AAEF,eAAe,QAAQ,CAAC"}
+{"version":3,"file":"manifest.d.ts","sourceRoot":"","sources":["../src/manifest.ts"],"names":[],"mappings":"AAAA,OAAO,KAAK,EAAE,yBAAyB,EAAE,MAAM,yBAAyB,CAAC;AAWzE,QAAA,MAAM,QAAQ,EAAE,yBAgIf,CAAC;AAEF,eAAe,QAAQ,CAAC"}

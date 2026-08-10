@@ -27,16 +27,17 @@ export type ServiceRecord = {
     name?: string;
     enabled?: boolean;
 };
-export declare function listServices(ctx: PluginContext): Promise<ServiceRecord[]>;
-export declare function getServiceNotify(ctx: PluginContext, serviceId: string): Promise<ServiceNotifyConfig>;
-export declare function saveServiceNotify(ctx: PluginContext, serviceId: string, cfg: ServiceNotifyConfig): Promise<void>;
+/** Per-company service list (NEO-79); delegates to the shared store. */
+export declare function listServices(ctx: PluginContext, companyId?: string): Promise<ServiceRecord[]>;
+export declare function getServiceNotify(ctx: PluginContext, serviceId: string, companyId?: string): Promise<ServiceNotifyConfig>;
+export declare function saveServiceNotify(ctx: PluginContext, serviceId: string, cfg: ServiceNotifyConfig, companyId?: string): Promise<void>;
 export declare function channelUserFor(cfg: ServiceNotifyConfig, paperclipUserId: string): string | null;
 export declare function paperclipUserFor(cfg: ServiceNotifyConfig, channelUserId: string): string | null;
 /**
  * Resolve a Cliq user (the button clicker) back to a Paperclip user, searching
  * every enabled Cliq service's mapping.
  */
-export declare function resolvePaperclipUserFromCliq(ctx: PluginContext, channelUserId: string): Promise<string | null>;
+export declare function resolvePaperclipUserFromCliq(ctx: PluginContext, channelUserId: string, companyId?: string): Promise<string | null>;
 /**
  * Paperclip company members that are users — mapping candidates for the picker.
  * (principalId only; the Cliq picker supplies names.)

@@ -12,6 +12,13 @@ export const JOB_KEYS = {
 export const WEBHOOK_KEYS = {
     cliq: "cliq-message",
     oauthCallback: "oauth-callback",
+    // Skeleton second channel — reference template (see src/modules/mail/).
+    mail: "mail-inbound",
+};
+/** Scoped JSON/HTML API routes (manifest `apiRoutes`, host-mounted). */
+export const API_ROUTE_KEYS = {
+    /** Public per-tenant "Connect your org" link (PRE-790 / PRE-329 T2). */
+    tenantConnect: "tenant-connect",
 };
 /** Zoho data center configuration */
 export const DATA_CENTERS = {

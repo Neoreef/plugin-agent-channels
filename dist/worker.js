@@ -6,52 +6,28 @@
  * and auth tokens, stored in bridge.service.{serviceId}.config / .auth.
  */
 import { definePlugin, runWorker, } from "@paperclipai/plugin-sdk";
-import { DATA_CENTERS, JOB_KEYS } from "./constants.js";
+import { API_ROUTE_KEYS, DATA_CENTERS, JOB_KEYS, PLUGIN_ID, WEBHOOK_KEYS } from "./constants.js";
+import { assembleAuthorizeUrl, buildTenantConnectUrl, consumeNonce, getTenantConnectConfig, renderConnectPage, resolveAppOAuthClient, } from "./lib/tenant-connect.js";
 import { proactiveServiceTokenRefresh } from "./lib/cliq-client.js";
-import { handleCliqWebhook } from "./modules/cliq/webhook-handler.js";
+import { listServices, saveServices, getServiceAuth, saveServiceAuth, deleteServiceAuth, getServiceOAuthConfig, saveServiceOAuthConfig, deleteServiceOAuthConfig, getServiceType, findConnectedService, } from "./lib/service-store.js";
+import { getChannel, getChannelByServiceType } from "./lib/channel-registry.js";
+// Side-effect import: registers all built-in channel modules into the registry.
+import "./channels.js";
 import { getBotMappings, saveBotMappings } from "./modules/cliq/bot-mapping.js";
 import { getServiceNotify, saveServiceNotify, listPaperclipUsers, } from "./modules/notifications/service-notify.js";
 import { listCliqUsers } from "./lib/cliq-client.js";
 import { notifyApprovalCreated } from "./modules/notifications/approvals.js";
 import { notifyIssueBlocked } from "./modules/notifications/blocked.js";
 let currentContext = null;
-// ─── Per-service state keys ──────────────────────────────────────────────────
-function serviceAuthKey(serviceId) {
-    return `bridge.service.${serviceId}.auth`;
-}
-function serviceConfigKey(serviceId) {
-    return `bridge.service.${serviceId}.config`;
-}
-async function getServiceAuth(ctx, serviceId) {
-    return (await ctx.state.get({ scopeKind: "instance", stateKey: serviceAuthKey(serviceId) }));
-}
-async function getServiceOAuthConfig(ctx, serviceId) {
-    return (await ctx.state.get({ scopeKind: "instance", stateKey: serviceConfigKey(serviceId) }));
-}
-// Legacy + per-service fallback
+// Token storage helpers (service registry, auth, config) live in
+// service-store.js, namespaced per company (NEO-79) with legacy-global fallback.
+// Legacy + per-service fallback — global health view (no company scope).
 async function getAuthState(ctx) {
     const global = (await ctx.state.get({ scopeKind: "instance", stateKey: "zoho.auth" }));
     if (global?.refreshToken)
         return global;
-    const services = (await ctx.state.get({ scopeKind: "instance", stateKey: "channels.services" })) ?? [];
-    for (const svc of services) {
-        const auth = await getServiceAuth(ctx, svc.id);
-        if (auth?.refreshToken)
-            return auth;
-    }
-    return null;
-}
-// Find first connected Cliq service ID
-async function getCliqServiceId(ctx) {
-    const services = (await ctx.state.get({ scopeKind: "instance", stateKey: "channels.services" })) ?? [];
-    for (const svc of services) {
-        if (svc.type === "zoho-cliq") {
-            const auth = await getServiceAuth(ctx, svc.id);
-            if (auth?.refreshToken)
-                return svc.id;
-        }
-    }
-    return null;
+    const found = await findConnectedService(ctx, "zoho-cliq");
+    return found?.auth ?? null;
 }
 // ─── OAuth Callback ──────────────────────────────────────────────────────────
 async function handleOAuthCallback(ctx, input) {
@@ -65,26 +41,52 @@ async function handleOAuthCallback(ctx, input) {
         ctx.logger.error("OAuth callback: no code");
         return;
     }
-    // Extract serviceId from state param
+    // Extract serviceId + companyId + channelType from state param. `companyId`
+    // routes token storage to the right company namespace (NEO-79); `channelType`
+    // routes post-auth setup to the right channel module (defaults to the
+    // service's registered type below when absent, for backward compatibility).
     const state = (body.state ?? {});
     const serviceId = state.serviceId;
+    const companyId = state.companyId;
+    const channelType = state.channelType;
     if (!serviceId) {
         ctx.logger.error("OAuth callback: no serviceId in state");
         return;
     }
-    const oauthConfig = await getServiceOAuthConfig(ctx, serviceId);
-    if (!oauthConfig?.clientId || !oauthConfig?.clientSecret) {
+    // CSRF: tenant-issued flows (hosted "Connect your org" page, PRE-790) carry a
+    // single-use, company-scoped nonce. Validate + consume it before touching any
+    // credentials. Operator connect URLs omit `src: "tenant"` and are unaffected.
+    if (state.src === "tenant") {
+        const ok = await consumeNonce(ctx, companyId ?? "", serviceId, state.nonce ?? "");
+        if (!ok) {
+            ctx.logger.error(`OAuth callback: rejected tenant flow — invalid/expired CSRF nonce (service ${serviceId})`);
+            return;
+        }
+    }
+    // Resolve OAuth client credentials. Operator connections store them per
+    // service (`save-service-oauth-config`); tenant self-service connections
+    // (PRE-790) never set per-service creds and instead use the shared app-level
+    // client from operator instance config — so fall back to it, mirroring the
+    // token-refresh path in cliq-client.ts.
+    const oauthConfig = await getServiceOAuthConfig(ctx, serviceId, companyId);
+    const appClient = await resolveAppOAuthClient(ctx);
+    const clientId = oauthConfig?.clientId || appClient?.clientId;
+    const clientSecret = oauthConfig?.clientSecret || appClient?.clientSecret;
+    const callbackUrl = oauthConfig?.callbackUrl || appClient?.callbackUrl;
+    if (!clientId || !clientSecret) {
         ctx.logger.error(`OAuth callback: no credentials for service ${serviceId}`);
         return;
     }
-    const dc = oauthConfig.dataCenter ?? "US";
+    // Data center: per-service config wins; otherwise the company's tenant-connect
+    // config (which drove the authorize URL) so the token center matches.
+    const dc = oauthConfig?.dataCenter ?? (companyId ? (await getTenantConnectConfig(ctx, companyId)).dataCenter : "US");
     const center = DATA_CENTERS[dc] ?? DATA_CENTERS.US;
     const params = new URLSearchParams({
         code,
-        client_id: oauthConfig.clientId,
-        client_secret: oauthConfig.clientSecret,
+        client_id: clientId,
+        client_secret: clientSecret,
         grant_type: "authorization_code",
-        ...(oauthConfig.callbackUrl ? { redirect_uri: oauthConfig.callbackUrl } : {}),
+        ...(callbackUrl ? { redirect_uri: callbackUrl } : {}),
     });
     const res = await ctx.http.fetch(`https://${center.accounts}/oauth/v2/token`, {
         method: "POST",
@@ -100,13 +102,29 @@ async function handleOAuthCallback(ctx, input) {
         ctx.logger.error(`OAuth returned incomplete data for ${serviceId}`);
         return;
     }
-    await ctx.state.set({ scopeKind: "instance", stateKey: serviceAuthKey(serviceId) }, {
+    const authState = {
         refreshToken: data.refresh_token,
         accessToken: data.access_token,
         expiresAt: Date.now() + (data.expires_in ?? 3600) * 1000 - 60_000,
         dataCenter: dc,
-    });
-    ctx.logger.info(`OAuth completed for service ${serviceId} (${dc})`);
+    };
+    await saveServiceAuth(ctx, serviceId, authState, companyId);
+    ctx.logger.info(`OAuth completed for service ${serviceId} (${dc})${companyId ? ` company=${companyId}` : ""}`);
+    // Route post-auth setup to the channel module. Prefer the explicit
+    // `state.channelType`; fall back to the service's stored type so existing
+    // connect URLs (which omit channelType) keep working.
+    const routeType = channelType ?? (await getServiceType(ctx, serviceId, companyId));
+    if (routeType) {
+        const channel = getChannelByServiceType(routeType);
+        if (channel?.onOAuthComplete) {
+            try {
+                await channel.onOAuthComplete(ctx, serviceId, authState, companyId);
+            }
+            catch (err) {
+                ctx.logger.error(`onOAuthComplete failed for ${routeType}: ${String(err)}`);
+            }
+        }
+    }
 }
 // ─── Plugin ─────────────────────────────────────────────────────────────────
 const plugin = definePlugin({
@@ -114,15 +132,35 @@ const plugin = definePlugin({
         currentContext = ctx;
         // ─── Jobs ─────────────────────────────────────────────────
         ctx.jobs.register(JOB_KEYS.tokenRefresh, async (_job) => {
-            // Refresh tokens for all connected services
-            const services = (await ctx.state.get({ scopeKind: "instance", stateKey: "channels.services" })) ?? [];
-            for (const svc of services) {
+            // Refresh tokens for every company's connected services (NEO-79). Each
+            // company namespaces its own `channels.services`, so iterate companies and
+            // refresh per company. Also sweep any legacy instance-scoped services.
+            let refreshed = 0;
+            try {
+                const companies = await ctx.companies.list({ limit: 200, offset: 0 });
+                for (const company of companies) {
+                    const services = await listServices(ctx, company.id);
+                    for (const svc of services) {
+                        try {
+                            await proactiveServiceTokenRefresh(ctx, svc.id, company.id);
+                            refreshed++;
+                        }
+                        catch { /* skip unconnected services */ }
+                    }
+                }
+            }
+            catch (err) {
+                ctx.logger.error(`Token refresh: company iteration failed: ${String(err)}`);
+            }
+            // Legacy global services (no company scope).
+            for (const svc of await listServices(ctx)) {
                 try {
                     await proactiveServiceTokenRefresh(ctx, svc.id);
+                    refreshed++;
                 }
-                catch { /* skip unconnected services */ }
+                catch { /* skip */ }
             }
-            ctx.logger.info("Token refresh job completed");
+            ctx.logger.info(`Token refresh job completed (${refreshed} service(s))`);
         });
         // ─── Events: approval + blocked-item notifications → Cliq ──
         ctx.events.on("approval.created", async (event) => {
@@ -144,15 +182,16 @@ const plugin = definePlugin({
         // ─── Per-service connection status ────────────────────────
         ctx.data.register("connection-status", async (params) => {
             const serviceId = params.serviceId;
+            const companyId = params.companyId;
             if (serviceId) {
-                let auth = await getServiceAuth(ctx, serviceId);
+                let auth = await getServiceAuth(ctx, serviceId, companyId);
                 if (!auth?.refreshToken) {
                     return { connected: false, dataCenter: "US", tokenValid: false };
                 }
                 if (!auth.expiresAt || Date.now() >= auth.expiresAt) {
                     try {
-                        await proactiveServiceTokenRefresh(ctx, serviceId);
-                        auth = await getServiceAuth(ctx, serviceId);
+                        await proactiveServiceTokenRefresh(ctx, serviceId, companyId);
+                        auth = await getServiceAuth(ctx, serviceId, companyId);
                     }
                     catch { /* report as expired */ }
                 }
@@ -175,26 +214,27 @@ const plugin = definePlugin({
         // ─── Per-service connect URL ──────────────────────────────
         ctx.data.register("connect-url", async (params) => {
             const serviceId = params.serviceId;
+            const companyId = params.companyId;
             const scopes = params.scopes;
             if (!serviceId)
                 return { connectUrl: "", configured: false };
-            const oauthConfig = await getServiceOAuthConfig(ctx, serviceId);
+            const oauthConfig = await getServiceOAuthConfig(ctx, serviceId, companyId);
             if (!oauthConfig?.clientId || !oauthConfig?.callbackUrl) {
                 return { connectUrl: "", configured: false };
             }
-            const dc = oauthConfig.dataCenter ?? "US";
-            const center = DATA_CENTERS[dc] ?? DATA_CENTERS.US;
-            const state = encodeURIComponent(JSON.stringify({ serviceId, pluginId: "agent-channels" }));
-            const connectUrl = `https://${center.accounts}/oauth/v2/auth?` +
-                new URLSearchParams({
-                    client_id: oauthConfig.clientId,
-                    response_type: "code",
-                    scope: scopes,
-                    redirect_uri: oauthConfig.callbackUrl,
-                    access_type: "offline",
-                    prompt: "consent",
-                    state,
-                }).toString();
+            // Embed companyId (NEO-79 — namespace routing on return) and channelType so
+            // the OAuth callback can store the token under the right company and route
+            // post-auth setup to the right channel module (see handleOAuthCallback /
+            // ChannelModule.onOAuthComplete). URL assembly is shared with the tenant
+            // entrypoint (buildTenantConnectUrl) so the two surfaces cannot drift.
+            const channelType = params.channelType ?? (await getServiceType(ctx, serviceId, companyId));
+            const connectUrl = assembleAuthorizeUrl({
+                dataCenter: oauthConfig.dataCenter ?? "US",
+                clientId: oauthConfig.clientId,
+                callbackUrl: oauthConfig.callbackUrl,
+                scopes,
+                state: { serviceId, companyId, channelType, pluginId: PLUGIN_ID },
+            });
             return { connectUrl, configured: true };
         });
         ctx.data.register("bot-mappings", async () => {
@@ -221,17 +261,18 @@ const plugin = definePlugin({
                 return { agents: [], error: String(e) };
             }
         });
-        // ─── Services registry ───────────────────────────────────
-        ctx.data.register("services", async () => {
-            const services = (await ctx.state.get({ scopeKind: "instance", stateKey: "channels.services" }));
-            return services ?? [];
+        // ─── Services registry (per company — NEO-79) ─────────────
+        ctx.data.register("services", async (params) => {
+            const companyId = params.companyId;
+            return await listServices(ctx, companyId);
         });
         // ─── Per-service user notifications (Paperclip → channel) ──
         ctx.data.register("service-notify", async (params) => {
             const serviceId = params.serviceId;
+            const companyId = params.companyId;
             if (!serviceId)
                 return { enabled: false, mappings: [] };
-            return await getServiceNotify(ctx, serviceId);
+            return await getServiceNotify(ctx, serviceId, companyId);
         });
         ctx.data.register("paperclip-users", async (params) => {
             try {
@@ -244,9 +285,11 @@ const plugin = definePlugin({
                 return { users: [], error: String(e) };
             }
         });
-        ctx.data.register("cliq-users", async () => {
+        ctx.data.register("cliq-users", async (params) => {
             try {
-                return { users: await listCliqUsers(ctx) };
+                const companyId = params.companyId;
+                const serviceId = params.serviceId;
+                return { users: await listCliqUsers(ctx, { companyId, serviceId }) };
             }
             catch (e) {
                 return { users: [], error: String(e) };
@@ -260,16 +303,18 @@ const plugin = definePlugin({
         });
         ctx.actions.register("save-service-notify", async (params) => {
             const serviceId = params.serviceId;
+            const companyId = params.companyId;
             const config = params.config;
             if (!serviceId || !config)
                 return { ok: false, error: "serviceId and config required" };
-            await saveServiceNotify(ctx, serviceId, config);
+            await saveServiceNotify(ctx, serviceId, config, companyId);
             return { ok: true };
         });
         ctx.actions.register("add-service", async (params) => {
             const serviceType = params.serviceType;
-            const services = (await ctx.state.get({ scopeKind: "instance", stateKey: "channels.services" })) ?? [];
-            const serviceId = `${serviceType}-${Date.now()}`;
+            const companyId = params.companyId;
+            const services = await listServices(ctx, companyId);
+            const serviceId = `${serviceType}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
             services.push({
                 id: serviceId,
                 type: serviceType,
@@ -277,21 +322,23 @@ const plugin = definePlugin({
                 enabled: true,
                 createdAt: new Date().toISOString(),
             });
-            await ctx.state.set({ scopeKind: "instance", stateKey: "channels.services" }, services);
+            await saveServices(ctx, services, companyId);
             return { ok: true, serviceId };
         });
         ctx.actions.register("remove-service", async (params) => {
             const serviceId = params.serviceId;
-            const services = (await ctx.state.get({ scopeKind: "instance", stateKey: "channels.services" })) ?? [];
+            const companyId = params.companyId;
+            const services = await listServices(ctx, companyId);
             const filtered = services.filter((s) => s.id !== serviceId);
-            await ctx.state.set({ scopeKind: "instance", stateKey: "channels.services" }, filtered);
-            await ctx.state.delete({ scopeKind: "instance", stateKey: serviceConfigKey(serviceId) });
-            await ctx.state.delete({ scopeKind: "instance", stateKey: serviceAuthKey(serviceId) });
+            await saveServices(ctx, filtered, companyId);
+            await deleteServiceOAuthConfig(ctx, serviceId, companyId);
+            await deleteServiceAuth(ctx, serviceId, companyId);
             return { ok: true };
         });
         // Per-service OAuth config
         ctx.actions.register("save-service-oauth-config", async (params) => {
             const serviceId = params.serviceId;
+            const companyId = params.companyId;
             if (!serviceId)
                 return { ok: false, error: "serviceId required" };
             const oauthConfig = {
@@ -300,21 +347,23 @@ const plugin = definePlugin({
                 callbackUrl: params.callbackUrl ?? "",
                 dataCenter: params.dataCenter ?? "US",
             };
-            await ctx.state.set({ scopeKind: "instance", stateKey: serviceConfigKey(serviceId) }, oauthConfig);
+            await saveServiceOAuthConfig(ctx, serviceId, oauthConfig, companyId);
             return { ok: true };
         });
         // Per-service disconnect
         ctx.actions.register("disconnect-service", async (params) => {
             const serviceId = params.serviceId;
+            const companyId = params.companyId;
             if (!serviceId)
                 return { ok: false };
-            await ctx.state.delete({ scopeKind: "instance", stateKey: serviceAuthKey(serviceId) });
-            ctx.logger.info(`Disconnected service ${serviceId}`);
+            await deleteServiceAuth(ctx, serviceId, companyId);
+            ctx.logger.info(`Disconnected service ${serviceId}${companyId ? ` company=${companyId}` : ""}`);
             return { ok: true };
         });
         // Legacy seed-auth (still useful for bootstrapping)
         ctx.actions.register("seed-auth", async (params) => {
             const serviceId = params.serviceId;
+            const companyId = params.companyId;
             const authState = {
                 refreshToken: params.refreshToken,
                 accessToken: params.accessToken,
@@ -323,12 +372,12 @@ const plugin = definePlugin({
                 connectedUser: params.connectedUser,
             };
             if (serviceId) {
-                await ctx.state.set({ scopeKind: "instance", stateKey: serviceAuthKey(serviceId) }, authState);
+                await saveServiceAuth(ctx, serviceId, authState, companyId);
             }
             else {
                 await ctx.state.set({ scopeKind: "instance", stateKey: "zoho.auth" }, authState);
             }
-            ctx.logger.info(`Auth state seeded${serviceId ? ` for service ${serviceId}` : ""}`);
+            ctx.logger.info(`Auth state seeded${serviceId ? ` for service ${serviceId}` : ""}${companyId ? ` company=${companyId}` : ""}`);
             return { ok: true };
         });
         ctx.logger.info("Agent Channels plugin setup complete");
@@ -358,16 +407,50 @@ const plugin = definePlugin({
         const ctx = currentContext;
         if (!ctx)
             throw new Error("Plugin not initialized");
-        switch (input.endpointKey) {
-            case "cliq-message":
-                await handleCliqWebhook(ctx, input.rawBody, input.parsedBody);
-                break;
-            case "oauth-callback":
-                await handleOAuthCallback(ctx, input);
-                break;
-            default:
-                throw new Error(`Unknown webhook endpoint: ${input.endpointKey}`);
+        // OAuth callback is shared channel infrastructure — one endpoint for every
+        // channel, routed to the right channel by `state.channelType` after token
+        // exchange (see handleOAuthCallback).
+        if (input.endpointKey === WEBHOOK_KEYS.oauthCallback) {
+            await handleOAuthCallback(ctx, input);
+            return;
         }
+        // All other webhooks dispatch through the channel registry — adding a
+        // channel is a registration call (src/channels.ts), not a core edit.
+        const channel = getChannel(input.endpointKey);
+        if (!channel) {
+            throw new Error(`Unknown webhook endpoint: ${input.endpointKey}`);
+        }
+        const result = await channel.handleWebhook(ctx, input);
+        if (!result.handled) {
+            ctx.logger.info(`Channel ${channel.getServiceType()} did not handle ${input.endpointKey}` +
+                (result.note ? `: ${result.note}` : ""));
+        }
+    },
+    // ─── Scoped API routes ───────────────────────────────────────
+    // Public per-tenant "Connect your org" surface (PRE-790 / PRE-329 T2). The
+    // host mounts this under /api/plugins/agent-channels/api/connect and resolves
+    // `companyId` from the query (manifest `apiRoutes[].companyResolution`). A
+    // tenant needs only this link — no operator UI, no operator credentials.
+    async onApiRequest(input) {
+        const ctx = currentContext;
+        if (!ctx)
+            throw new Error("Plugin not initialized");
+        if (input.routeKey === API_ROUTE_KEYS.tenantConnect) {
+            const companyId = input.companyId || (typeof input.query.companyId === "string" ? input.query.companyId : "");
+            const channelType = typeof input.query.channelType === "string" ? input.query.channelType : undefined;
+            const result = await buildTenantConnectUrl(ctx, { companyId, channelType, pluginId: PLUGIN_ID });
+            const status = result.configured ? 200 : 409;
+            // `?format=json` returns the authorize URL for programmatic callers (e.g.
+            // Caddy landing templating, PRE-789); default serves the hosted HTML page.
+            if (input.query.format === "json") {
+                const body = result.configured
+                    ? { configured: true, connectUrl: result.connectUrl, serviceId: result.serviceId, channelType: result.channelType }
+                    : { configured: false, reason: result.reason };
+                return { status, headers: { "content-type": "application/json; charset=utf-8" }, body };
+            }
+            return { status, headers: { "content-type": "text/html; charset=utf-8" }, body: renderConnectPage(result) };
+        }
+        return { status: 404, headers: { "content-type": "application/json; charset=utf-8" }, body: { error: `Unknown route: ${input.routeKey}` } };
     },
     async onShutdown() {
         currentContext?.logger.info("Agent Channels plugin shutting down");

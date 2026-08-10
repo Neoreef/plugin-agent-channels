@@ -23,6 +23,10 @@ export interface DraftStreamParams {
     userId: string;
     agentName?: string;
     initialRef?: CliqMessageRef;
+    /** Company that owns this conversation — scopes the Zoho token (NEO-79). */
+    companyId?: string;
+    /** Specific channel service to authenticate as (optional). */
+    serviceId?: string;
 }
 export type CliqDraftStream = {
     update: (text: string) => void;

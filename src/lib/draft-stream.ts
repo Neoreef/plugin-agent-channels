@@ -31,6 +31,10 @@ export interface DraftStreamParams {
   userId: string;
   agentName?: string;
   initialRef?: CliqMessageRef;
+  /** Company that owns this conversation — scopes the Zoho token (NEO-79). */
+  companyId?: string;
+  /** Specific channel service to authenticate as (optional). */
+  serviceId?: string;
 }
 
 export type CliqDraftStream = {
@@ -54,6 +58,8 @@ const STOP_BUTTON_THRESHOLD_MS = 5000;
 
 export function createCliqDraftStream(params: DraftStreamParams): CliqDraftStream {
   const { ctx } = params;
+  // Company/service scope so every send/edit/delete uses the right Zoho token.
+  const scope = { companyId: params.companyId, serviceId: params.serviceId };
 
   let currentRef: CliqMessageRef | null = params.initialRef ?? null;
   let didSend = !!params.initialRef?.chatId;
@@ -199,6 +205,7 @@ export function createCliqDraftStream(params: DraftStreamParams): CliqDraftStrea
           slides: payload.slides as any,
           bot: payload.bot as any,
           buttons: payload.buttons as any,
+          ...scope,
         });
       } catch (err) {
         ctx.logger.error(`draft-stream finalise edit failed: ${String(err)}`);
@@ -217,6 +224,7 @@ export function createCliqDraftStream(params: DraftStreamParams): CliqDraftStrea
         slides: payload.slides as any,
         bot: payload.bot as any,
         buttons: payload.buttons as any,
+        ...scope,
       });
       didSend = true;
 
@@ -249,6 +257,7 @@ export function createCliqDraftStream(params: DraftStreamParams): CliqDraftStrea
           bot: payload.bot as any,
           buttons: payload.buttons as any,
           skipRateLimit: true,
+          ...scope,
         });
 
         if (result.status === 400 || result.status === 403) {
@@ -404,7 +413,7 @@ export function createCliqDraftStream(params: DraftStreamParams): CliqDraftStrea
     if (animationTimer) { clearInterval(animationTimer); animationTimer = null; }
 
     if (currentState.kind !== "message" && currentRef?.chatId && currentRef?.messageId) {
-      deleteCliqMessage(ctx, currentRef.chatId, currentRef.messageId).catch(() => {});
+      deleteCliqMessage(ctx, currentRef.chatId, currentRef.messageId, scope).catch(() => {});
     }
   }
 

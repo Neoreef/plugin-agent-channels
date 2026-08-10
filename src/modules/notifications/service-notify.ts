@@ -8,6 +8,7 @@
  */
 
 import type { PluginContext } from "@paperclipai/plugin-sdk";
+import { listServices as listStoredServices, serviceStore } from "../../lib/service-store.js";
 
 export type ChannelUserMapping = {
   /** Paperclip principalId (principalType === "user"). */
@@ -25,20 +26,23 @@ export type ServiceNotifyConfig = {
   mappings: ChannelUserMapping[];
 };
 
-const notifyKey = (serviceId: string) => `bridge.service.${serviceId}.notify`;
+/**
+ * The notify mapping is just another per-connection slot (`bridge.service.<id>.notify`),
+ * so it rides the shared connection store's slot API — same company scoping and
+ * legacy instance-scope fallback as auth/config, no duplicated logic (NEO-120).
+ */
+const NOTIFY_SLOT = "notify";
 
 export type ServiceRecord = { id: string; type: string; name?: string; enabled?: boolean };
 
-export async function listServices(ctx: PluginContext): Promise<ServiceRecord[]> {
-  return ((await ctx.state.get({ scopeKind: "instance", stateKey: "channels.services" })) as
-    | ServiceRecord[]
-    | null) ?? [];
+/** Per-company service list (NEO-79); delegates to the shared store. */
+export async function listServices(ctx: PluginContext, companyId?: string): Promise<ServiceRecord[]> {
+  return await listStoredServices(ctx, companyId);
 }
 
-export async function getServiceNotify(ctx: PluginContext, serviceId: string): Promise<ServiceNotifyConfig> {
-  const v = (await ctx.state.get({ scopeKind: "instance", stateKey: notifyKey(serviceId) })) as
-    | ServiceNotifyConfig
-    | null;
+export async function getServiceNotify(ctx: PluginContext, serviceId: string, companyId?: string): Promise<ServiceNotifyConfig> {
+  // Company scope with legacy instance-scope fallback, handled by the shared store.
+  const v = await serviceStore.getSlot<ServiceNotifyConfig>(ctx, serviceId, NOTIFY_SLOT, companyId);
   return v ?? { enabled: false, mappings: [] };
 }
 
@@ -46,8 +50,9 @@ export async function saveServiceNotify(
   ctx: PluginContext,
   serviceId: string,
   cfg: ServiceNotifyConfig,
+  companyId?: string,
 ): Promise<void> {
-  await ctx.state.set({ scopeKind: "instance", stateKey: notifyKey(serviceId) }, cfg);
+  await serviceStore.setSlot<ServiceNotifyConfig>(ctx, serviceId, NOTIFY_SLOT, cfg, companyId);
 }
 
 export function channelUserFor(cfg: ServiceNotifyConfig, paperclipUserId: string): string | null {
@@ -67,10 +72,11 @@ export function paperclipUserFor(cfg: ServiceNotifyConfig, channelUserId: string
 export async function resolvePaperclipUserFromCliq(
   ctx: PluginContext,
   channelUserId: string,
+  companyId?: string,
 ): Promise<string | null> {
-  for (const svc of await listServices(ctx)) {
+  for (const svc of await listServices(ctx, companyId)) {
     if (svc.type !== "zoho-cliq") continue;
-    const notify = await getServiceNotify(ctx, svc.id);
+    const notify = await getServiceNotify(ctx, svc.id, companyId);
     const pid = paperclipUserFor(notify, channelUserId);
     if (pid) return pid;
   }
